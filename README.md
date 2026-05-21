@@ -192,6 +192,8 @@ streamlit run streamlit_app.py
 
 ---
 
+
+
 ## Document Types Supported
 
 | Document | Key Data Extracted |
