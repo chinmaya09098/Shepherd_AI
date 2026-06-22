@@ -41,6 +41,13 @@ class Config:
     # Azure OpenAI Embedding
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT: Optional[str] = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
+    # Microsoft Graph API / Azure AD OAuth
+    # Used by GraphClient (converted from GraphTest appsettings.json AzureOutlookAPI section)
+    AZURE_AD_TENANT_ID: Optional[str] = os.getenv("AZURE_AD_TENANT_ID")
+    AZURE_AD_CLIENT_ID: Optional[str] = os.getenv("AZURE_AD_CLIENT_ID")
+    AZURE_AD_CLIENT_SECRET: Optional[str] = os.getenv("AZURE_AD_CLIENT_SECRET")
+    GRAPH_REDIRECT_URI: str = os.getenv("GRAPH_REDIRECT_URI", "http://localhost:8501")
+
     # Other Configuration
     EMAIL_EXAMPLES_DIR: str = os.getenv("EMAIL_EXAMPLES_DIR", "Load_Tender_Email_Examples")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "output")

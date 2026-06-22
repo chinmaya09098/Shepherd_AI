@@ -5,6 +5,7 @@ import streamlit as st
 import tempfile
 import json
 import logging
+import asyncio
 from pathlib import Path
 from typing import List, Optional
 import sys
@@ -27,6 +28,9 @@ from src.services.search_client import find_customer_matches
 from src.utils.blob_log_handler import BlobLogHandler
 from src.utils.logger import get_logger
 from src.ui.styles import get_light_theme_css
+from src.services.graph_client import GraphClient
+from src.models.graph_models import GraphConfig, GraphToken, MailMessage
+from src.readers.graph_email_reader import GraphEmailReader
 
 # Configure Streamlit page
 st.set_page_config(
@@ -56,6 +60,21 @@ if 'source_breakdown' not in st.session_state:
     st.session_state.source_breakdown = None
 if 'raw_cu_results' not in st.session_state:
     st.session_state.raw_cu_results = None
+# Graph API session state
+if 'graph_token' not in st.session_state:
+    st.session_state.graph_token = None
+if 'graph_connected' not in st.session_state:
+    st.session_state.graph_connected = False
+if 'graph_user' not in st.session_state:
+    st.session_state.graph_user = None
+if 'graph_messages' not in st.session_state:
+    st.session_state.graph_messages = []
+if 'graph_shipments' not in st.session_state:
+    st.session_state.graph_shipments = []
+if 'graph_email_processed' not in st.session_state:
+    st.session_state.graph_email_processed = False
+if 'graph_email_data' not in st.session_state:
+    st.session_state.graph_email_data = None
 
 
 def _get_blob_service_client() -> Optional[BlobServiceClient]:
@@ -602,6 +621,546 @@ def format_shipment_json(shipment: Shipment) -> str:
     return shipment.model_dump_json(by_alias=True, exclude_none=True, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Microsoft Graph API helpers
+# ---------------------------------------------------------------------------
+
+def run_async(coro):
+    """Run an async coroutine synchronously from Streamlit's sync context."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # If there is already a running event loop (e.g. Jupyter), fall back to a thread.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+
+
+def _init_graph_client() -> Optional[GraphClient]:
+    """Create a GraphClient from Config. Returns None if Graph API is not configured."""
+    if not all([Config.AZURE_AD_TENANT_ID, Config.AZURE_AD_CLIENT_ID, Config.AZURE_AD_CLIENT_SECRET]):
+        return None
+    config = GraphConfig(
+        tenant_id=Config.AZURE_AD_TENANT_ID,
+        client_id=Config.AZURE_AD_CLIENT_ID,
+        client_secret=Config.AZURE_AD_CLIENT_SECRET,
+        redirect_uri=Config.GRAPH_REDIRECT_URI,
+    )
+    return GraphClient(config)
+
+
+def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
+    """
+    Process a Graph API email dict through the full extraction pipeline.
+
+    Equivalent to process_email_blob() but takes an already-converted email_data
+    dict from GraphEmailReader instead of downloading from Azure Blob Storage.
+
+    Args:
+        email_data: EMLParser-compatible dict from GraphEmailReader._convert_message()
+        message_id: Graph message ID (used for naming saved outputs)
+
+    Returns:
+        List of shipment dicts (same schema as process_email_blob)
+    """
+    shipments = []
+    email_name = email_data.get('subject', message_id) or message_id
+
+    try:
+        if not Config.validate():
+            st.error("Configuration validation failed. Please check your .env file.")
+            return []
+
+        with st.spinner("Initializing processors..."):
+            content_extractor = ContentUnderstandingExtractor()
+            openai_agent = OpenAIAgent()
+
+        st.session_state.graph_email_data = email_data
+        st.success(f"Email loaded: {email_data.get('subject', '(No subject)')}")
+        st.info(f"Found {len(email_data.get('attachments', []))} attachments")
+
+        # Resolve customer ID
+        with st.spinner("Resolving customer ID..."):
+            try:
+                sender_email = email_data.get('from', '')
+                receiver_email = email_data.get('to', '')
+                search_result = find_customer_matches(sender_email, receiver_email)
+                matches = search_result["matches"]
+                is_broker = search_result["is_broker_match"]
+
+                if is_broker and matches:
+                    resolved_customer_id = matches[0]["customerId"]
+                elif matches:
+                    resolved_customer_id = openai_agent.resolve_customer_id(
+                        sender_email=sender_email,
+                        email_subject=email_data.get('subject', ''),
+                        customer_list=matches,
+                    )
+                else:
+                    resolved_customer_id = None
+            except Exception as e:
+                logger.error(f"Customer ID resolution failed: {e}")
+                resolved_customer_id = None
+
+        attachments = email_data.get('attachments', [])
+
+        if attachments:
+            # Pre-extract text from all attachments
+            attachment_data = []
+            raw_cu = {}
+            for attachment in attachments:
+                result = content_extractor.extract_text(attachment['filepath'])
+                if result:
+                    text, confidence, raw_result = result
+                    attachment_data.append({'attachment': attachment, 'text': text, 'confidence': confidence})
+                    if raw_result:
+                        raw_cu[attachment['filename']] = raw_result
+                else:
+                    st.warning(f"No text extracted from {attachment['filename']}, skipping")
+            st.session_state.raw_cu_results = raw_cu if raw_cu else None
+
+            # Per-source structured extraction
+            with st.spinner("Extracting structured data per source..."):
+                breakdown = {}
+                breakdown["emailBody"] = openai_agent.extract_source_fields(email_data['body'])
+                for d in attachment_data:
+                    breakdown[d['attachment']['filename']] = openai_agent.extract_source_fields(d['text'])
+            st.session_state.source_breakdown = breakdown
+
+            # Pass 1: envelope
+            all_attachment_texts = "\n\n---\n\n".join(
+                f"[{d['attachment']['filename']}]\n{d['text']}" for d in attachment_data
+            )
+            with st.spinner("Analyzing email context..."):
+                envelope = openai_agent.extract_email_envelope(
+                    email_body=email_data['body'],
+                    all_attachment_texts=all_attachment_texts
+                )
+            st.session_state.envelope = envelope
+
+            # Body shipments unrelated to attachments
+            if not envelope.get('bodyRelatedToAttachments', True):
+                with st.spinner("Extracting shipments from email body..."):
+                    body_shipments = openai_agent.extract_body_shipments(email_data['body'], envelope)
+                for i, shipment in enumerate(body_shipments, 1):
+                    _validate_zip_fields(shipment)
+                    shipments.append({
+                        'shipment': shipment,
+                        'attachment_name': 'Email Body',
+                        'attachment_index': 0,
+                        'email_name': email_name,
+                        'is_body_shipment': True,
+                        'body_shipment_index': i,
+                        'total_body_shipments': len(body_shipments),
+                        'customer_id': resolved_customer_id,
+                    })
+                if body_shipments:
+                    st.success(f"Extracted {len(body_shipments)} shipment(s) from email body")
+
+            # Pass 2: per-attachment extraction
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            for idx, data in enumerate(attachment_data, 1):
+                attachment = data['attachment']
+                status_text.markdown(
+                    f'<p style="color: #FFFFFF !important; font-size: 16px; font-weight: 500;">'
+                    f'Processing attachment {idx}/{len(attachment_data)}: {attachment["filename"]}</p>',
+                    unsafe_allow_html=True,
+                )
+                progress_bar.progress(idx / len(attachment_data))
+
+                with st.spinner(f"Extracting shipment data from {attachment['filename']}..."):
+                    shipment = openai_agent.extract_shipment_data(
+                        attachment_text=data['text'],
+                        envelope=envelope
+                    )
+
+                if shipment:
+                    fallback_items = []
+                    for i in (st.session_state.source_breakdown or {}).get(attachment['filename'], {}).get('items', []):
+                        if not isinstance(i, dict):
+                            continue
+                        fallback_items.append({
+                            "description": i.get("description"),
+                            "pieces": i.get("pieces") or i.get("quantity"),
+                            "weight": i.get("weight"),
+                            "unit": i.get("unit"),
+                            "pallets": i.get("pallets"),
+                            "dimensions": i.get("dimensions"),
+                            "quantity": i.get("quantity"),
+                        })
+                    if fallback_items and len(fallback_items) > len(shipment.required_fields.items):
+                        from src.models.shipment import ShipmentItem
+                        shipment.required_fields.items = [
+                            ShipmentItem.model_validate(i) for i in fallback_items
+                        ]
+
+                    shipment.nice_to_have_fields.extraction_confidence = data['confidence']
+                    _validate_zip_fields(shipment)
+                    shipments.append({
+                        'shipment': shipment,
+                        'attachment_name': attachment['filename'],
+                        'attachment_index': idx,
+                        'email_name': email_name,
+                        'customer_id': resolved_customer_id,
+                    })
+                    if not shipment.missing_required_fields:
+                        _save_shipment_json_to_blob(
+                            shipment,
+                            email_name=email_name,
+                            source_name=attachment['filename'],
+                            index=idx,
+                            customer_id=resolved_customer_id,
+                        )
+                    st.success(f"Extracted shipment data from {attachment['filename']}")
+                else:
+                    st.warning(f"Failed to extract shipment data from {attachment['filename']}")
+
+            progress_bar.empty()
+            status_text.empty()
+
+        else:
+            st.info("No attachments found. Attempting to extract shipment data from email body...")
+            with st.spinner("Extracting shipment data from email body..."):
+                shipment = openai_agent.extract_shipment_data(
+                    attachment_text=email_data['body'],
+                    envelope=None
+                )
+            if shipment:
+                _validate_zip_fields(shipment)
+                shipments.append({
+                    'shipment': shipment,
+                    'attachment_name': 'Email Body',
+                    'attachment_index': 1,
+                    'email_name': email_name,
+                    'customer_id': resolved_customer_id,
+                })
+                if not shipment.missing_required_fields:
+                    _save_shipment_json_to_blob(
+                        shipment,
+                        email_name=email_name,
+                        source_name='Email Body',
+                        index=1,
+                        customer_id=resolved_customer_id,
+                    )
+                st.success("Extracted shipment data from email body")
+            else:
+                st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
+
+        return shipments
+
+    except Exception as e:
+        st.error(f"Error processing Graph email: {str(e)}")
+        logger.error(f"Error processing Graph email: {e}", exc_info=True)
+        return []
+
+
+def _render_graph_tab():
+    """Render the Live Mailbox (Microsoft Graph) tab content."""
+
+    # ── Handle OAuth callback (Microsoft redirects back with ?code=...) ──────
+    params = st.query_params
+    auth_code = params.get("code")
+    auth_state = params.get("state")
+
+    if auth_code and auth_state in ("add", "update") and not st.session_state.graph_connected:
+        client = _init_graph_client()
+        if client:
+            with st.spinner("Completing Microsoft sign-in..."):
+                try:
+                    token = run_async(client.exchange_code_for_tokens(auth_code))
+                    user_profile = run_async(client.get_user_profile(token.access_token))
+                    st.session_state.graph_token = token
+                    st.session_state.graph_connected = True
+                    st.session_state.graph_user = (
+                        user_profile.user_principal_name if user_profile else "Unknown"
+                    )
+                    st.query_params.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Microsoft sign-in failed: {e}")
+                    logger.error(f"Graph OAuth callback error: {e}", exc_info=True)
+                    st.query_params.clear()
+                    return
+
+    # ── Check Graph API configuration ─────────────────────────────────────────
+    graph_configured = all([
+        Config.AZURE_AD_TENANT_ID and Config.AZURE_AD_TENANT_ID != "your-tenant-id",
+        Config.AZURE_AD_CLIENT_ID and Config.AZURE_AD_CLIENT_ID != "your-client-id",
+        Config.AZURE_AD_CLIENT_SECRET and Config.AZURE_AD_CLIENT_SECRET != "your-client-secret",
+    ])
+
+    if not graph_configured:
+        st.warning(
+            "Microsoft Graph API credentials are not configured. "
+            "Add **AZURE_AD_TENANT_ID**, **AZURE_AD_CLIENT_ID**, and **AZURE_AD_CLIENT_SECRET** "
+            "to your `.env` file to enable live mailbox access."
+        )
+        with st.expander("Configuration guide"):
+            st.markdown("""
+**Required `.env` variables:**
+```
+AZURE_AD_TENANT_ID=<your Azure AD tenant ID>
+AZURE_AD_CLIENT_ID=<App Registration client/application ID>
+AZURE_AD_CLIENT_SECRET=<App Registration client secret>
+GRAPH_REDIRECT_URI=http://localhost:8501
+```
+
+**Steps:**
+1. Create an App Registration in Azure Active Directory
+2. Add Delegated permissions: `Mail.Read`, `Mail.ReadWrite`, `Mail.Send`, `User.Read`
+3. Grant admin consent for the permissions
+4. Add `http://localhost:8501` as a Redirect URI (Web platform)
+5. Copy the Tenant ID, Client ID, and Client Secret into `.env`
+""")
+        return
+
+    client = _init_graph_client()
+
+    # ── Not connected: show Sign In button ────────────────────────────────────
+    if not st.session_state.graph_connected:
+        st.info(
+            "Connect your Microsoft mailbox to read live emails directly. "
+            "You will be redirected to Microsoft's sign-in page and returned here after authentication."
+        )
+        st.markdown(
+            "**Redirect URI** (must be registered in your Azure App Registration as a Web redirect URI):"
+        )
+        st.code(Config.GRAPH_REDIRECT_URI, language=None)
+
+        auth_url = client.get_auth_url(state="add")
+        st.markdown(
+            f'<a href="{auth_url}" target="_self" style="display:inline-block;padding:10px 22px;'
+            f'background-color:#0078d4;color:white;text-decoration:none;border-radius:6px;'
+            f'font-weight:600;font-size:0.95rem;">Sign in with Microsoft</a>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Connected ─────────────────────────────────────────────────────────────
+    col_status, col_disconnect = st.columns([4, 1])
+    with col_status:
+        st.success(f"Connected as: **{st.session_state.graph_user}**")
+    with col_disconnect:
+        if st.button("Disconnect", key="graph_disconnect"):
+            st.session_state.graph_token = None
+            st.session_state.graph_connected = False
+            st.session_state.graph_user = None
+            st.session_state.graph_messages = []
+            st.session_state.graph_shipments = []
+            st.session_state.graph_email_processed = False
+            st.session_state.graph_email_data = None
+            st.rerun()
+
+    # Load inbox
+    col_load, _ = st.columns([1, 4])
+    with col_load:
+        load_inbox = st.button(
+            "Load Inbox", type="primary", key="graph_load_inbox", use_container_width=True
+        )
+
+    if load_inbox:
+        with st.spinner("Loading inbox emails..."):
+            try:
+                updated_token, messages = run_async(
+                    client.read_inbox(st.session_state.graph_token)
+                )
+                st.session_state.graph_token = updated_token
+                st.session_state.graph_messages = messages
+                if messages:
+                    st.success(f"Loaded {len(messages)} email(s) from inbox")
+                else:
+                    st.info("Inbox is empty or no new messages found.")
+            except Exception as e:
+                st.error(f"Failed to load inbox: {e}")
+                logger.error(f"Graph inbox load error: {e}", exc_info=True)
+
+    # ── Email list and processing ─────────────────────────────────────────────
+    if st.session_state.graph_messages:
+        messages: List[MailMessage] = st.session_state.graph_messages
+
+        def _fmt_msg(msg: MailMessage) -> str:
+            from_str = ""
+            if msg.from_ and msg.from_.email_address:
+                ea = msg.from_.email_address
+                from_str = ea.name or ea.address or ""
+            date_str = ""
+            if msg.received_date_time:
+                date_str = msg.received_date_time.strftime("%b %d, %Y %H:%M")
+            subject = msg.subject or "(No subject)"
+            att_flag = "  [+att]" if msg.has_attachments else ""
+            unread = "● " if not msg.is_read else "  "
+            return f"{unread}{date_str}  |  {from_str}  |  {subject}{att_flag}"
+
+        selected_idx = st.selectbox(
+            "Select an email to process:",
+            options=range(len(messages)),
+            format_func=_fmt_msg,
+            key="graph_email_select",
+        )
+
+        col_proc, _ = st.columns([1, 4])
+        with col_proc:
+            process_graph_btn = st.button(
+                "Process Email",
+                type="primary",
+                key="graph_process_email",
+                use_container_width=True,
+            )
+
+        if process_graph_btn:
+            # Clear previous results (both graph and blob tabs)
+            st.session_state.graph_shipments = []
+            st.session_state.graph_email_processed = False
+            st.session_state.graph_email_data = None
+            st.session_state.shipments = []
+            st.session_state.email_processed = False
+            st.session_state.source_breakdown = None
+            st.session_state.raw_cu_results = None
+            st.session_state.envelope = None
+
+            selected_message = messages[selected_idx]
+
+            with st.container():
+                with st.spinner("Downloading email and attachments from Graph API..."):
+                    try:
+                        reader = GraphEmailReader(client, attachment_output_dir=Config.OUTPUT_DIR)
+                        updated_token, email_data = run_async(
+                            reader.read_single_email(st.session_state.graph_token, selected_message)
+                        )
+                        st.session_state.graph_token = updated_token
+                    except Exception as e:
+                        st.error(f"Failed to download email from Graph API: {e}")
+                        logger.error(f"Graph email download error: {e}", exc_info=True)
+                        email_data = None
+
+                if email_data:
+                    shipments_data = process_graph_email(
+                        email_data=email_data,
+                        message_id=selected_message.id or "",
+                    )
+
+                    if shipments_data:
+                        st.session_state.graph_shipments = shipments_data
+                        st.session_state.graph_email_processed = True
+                        # Sync to shared shipments so display_shipment/missing-fields works correctly
+                        st.session_state.shipments = shipments_data
+                        st.success(f"Successfully processed {len(shipments_data)} shipment(s)!")
+                    else:
+                        st.error("No shipments were extracted from this email.")
+
+    # ── Display results ───────────────────────────────────────────────────────
+    if st.session_state.graph_email_processed and st.session_state.graph_shipments:
+        st.divider()
+
+        if st.session_state.raw_cu_results:
+            raw_cu_json = json.dumps(st.session_state.raw_cu_results, indent=2)
+            with st.expander("View Raw JSON"):
+                st.code(raw_cu_json, language="json")
+            st.download_button(
+                label="Download Raw JSON",
+                data=raw_cu_json,
+                file_name="raw_content_understanding.json",
+                mime="application/json",
+                type="secondary",
+                key="graph_dl_raw_json",
+            )
+
+        if st.session_state.graph_email_data:
+            with st.expander("Email Preview"):
+                _display_email_preview(st.session_state.graph_email_data)
+
+        if st.session_state.source_breakdown:
+            breakdown_json = json.dumps(st.session_state.source_breakdown, indent=2)
+            with st.expander("Normalized JSON"):
+                st.code(breakdown_json, language="json")
+            st.download_button(
+                label="Download Normalized JSON",
+                data=breakdown_json,
+                file_name="normalized_json.json",
+                mime="application/json",
+                type="secondary",
+                key="graph_dl_norm_json",
+            )
+
+        st.divider()
+        st.header("Extracted Shipments")
+
+        shipments_list = st.session_state.graph_shipments
+        st.info(f"Found {len(shipments_list)} shipment(s)")
+
+        if len(shipments_list) == 1:
+            shipment_data = shipments_list[0]
+            display_shipment(
+                shipment_data["shipment"],
+                shipment_data["attachment_name"],
+                1,
+                shipment_idx=0,
+                customer_id=_get_customer_id(shipment_data),
+            )
+        else:
+            result_tabs = st.tabs([
+                f"Shipment {idx}: {data['attachment_name']}"
+                for idx, data in enumerate(shipments_list, 1)
+            ])
+            for result_tab, (idx, shipment_data) in zip(result_tabs, enumerate(shipments_list)):
+                with result_tab:
+                    display_shipment(
+                        shipment_data["shipment"],
+                        shipment_data["attachment_name"],
+                        shipment_data["attachment_index"],
+                        shipment_idx=idx,
+                        customer_id=_get_customer_id(shipment_data),
+                    )
+
+        # Download ZIP of complete shipments
+        downloadable = [
+            s for s in shipments_list
+            if s["shipment"].email_type != "spam"
+            and not _has_blocking_missing_fields(s["shipment"])
+        ]
+        if downloadable:
+            import zipfile
+            import io
+
+            st.divider()
+            col1, _ = st.columns([1, 1])
+            with col1:
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    body_shipments = [s for s in downloadable if s.get('is_body_shipment')]
+                    non_body_shipments = [s for s in downloadable if not s.get('is_body_shipment')]
+
+                    for idx, sd in enumerate(non_body_shipments, 1):
+                        json_content = format_client_json_str(sd["shipment"], customer_id=_get_customer_id(sd))
+                        filename = f"shipment_{idx}_{Path(sd['attachment_name']).stem}.json"
+                        zf.writestr(filename, json_content)
+
+                    if len(body_shipments) == 1:
+                        zf.writestr(
+                            "shipment_email_body.json",
+                            format_client_json_str(body_shipments[0]["shipment"], customer_id=_get_customer_id(body_shipments[0])),
+                        )
+                    elif len(body_shipments) > 1:
+                        combined = {
+                            f"shipment_{i+1}": json.loads(format_client_json_str(s["shipment"], customer_id=_get_customer_id(s)))
+                            for i, s in enumerate(body_shipments)
+                        }
+                        zf.writestr("shipment_email_body.json", json.dumps(combined, indent=2))
+
+                st.download_button(
+                    label="Download All Shipments (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="all_shipments.zip",
+                    mime="application/zip",
+                    type="secondary",
+                    use_container_width=True,
+                    key="graph_dl_all_zip",
+                )
+
+
 def main():
     """Main Streamlit app"""
     
@@ -658,152 +1217,162 @@ def main():
     """
     st.markdown(header_html, unsafe_allow_html=True)
     st.divider()
-    
-    # Load emails from Azure Blob Storage
-    selected_blob: Optional[str] = None
 
-    with st.spinner("Loading emails from Azure Blob Storage..."):
-        st.session_state.blob_emails = list_email_blobs(prefix="sample-mails/")
+    # ── Main tabs ─────────────────────────────────────────────────────────────
+    tab_graph, tab_blob = st.tabs(["Live Mailbox (Microsoft Graph)", "Azure Blob Storage"])
 
-    if not st.session_state.blob_emails:
-        st.warning("No .eml files found in Azure Blob Storage under 'sample-mails/'.")
-    else:
-        selected_blob = st.selectbox(
-            "Select an email from Azure Blob Storage to extract shipment information from attachments",
-            options=st.session_state.blob_emails,
-            format_func=lambda name: Path(name).name,
-        )
+    with tab_graph:
+        _render_graph_tab()
 
-    # Process button (only when a blob is selected)
-    if selected_blob is not None:
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            process_button = st.button("Process Email", type="primary", use_container_width=True, key="process_email")
+    with tab_blob:
+        # Load emails from Azure Blob Storage
+        selected_blob: Optional[str] = None
 
-        if process_button:
-            # Clear previous results
-            st.session_state.shipments = []
-            st.session_state.email_processed = False
-            st.session_state.email_data = None
-            st.session_state.envelope = None
-            st.session_state.source_breakdown = None
-            st.session_state.raw_cu_results = None
+        with st.spinner("Loading emails from Azure Blob Storage..."):
+            st.session_state.blob_emails = list_email_blobs(prefix="sample-mails/")
 
-            # Process email from Azure Blob Storage
-            with st.container():
-                shipments_data = process_email_blob(selected_blob)
-
-                if shipments_data:
-                    st.session_state.shipments = shipments_data
-                    st.session_state.email_processed = True
-                    st.success(f"Successfully processed {len(shipments_data)} shipments!")
-                else:
-                    st.error("No shipments were extracted. Please check the email file and try again.")
-    
-    # Display results
-    if st.session_state.email_processed and st.session_state.shipments:
-        st.divider()
-
-        # Raw Content Understanding JSON (before email preview)
-        if st.session_state.raw_cu_results:
-            raw_cu_json = json.dumps(st.session_state.raw_cu_results, indent=2)
-            with st.expander("View Raw JSON"):
-                st.code(raw_cu_json, language="json")
-            st.download_button(
-                label="Download Raw JSON",
-                data=raw_cu_json,
-                file_name="raw_content_understanding.json",
-                mime="application/json",
-                type="secondary",
-            )
-
-        # Email preview
-        if st.session_state.email_data:
-            with st.expander("Email Preview"):
-                _display_email_preview(st.session_state.email_data)
-
-        # Normalized JSON (per-source structured breakdown)
-        if st.session_state.source_breakdown:
-            breakdown_json = json.dumps(st.session_state.source_breakdown, indent=2)
-            with st.expander("Normalized JSON"):
-                st.code(breakdown_json, language="json")
-            st.download_button(
-                label="Download Normalized JSON",
-                data=breakdown_json,
-                file_name="normalized_json.json",
-                mime="application/json",
-                type="secondary",
-            )
-
-        st.divider()
-
-        st.header("Extracted Shipments")
-        st.info(f"Found {len(st.session_state.shipments)} shipment(s)")
-
-        if len(st.session_state.shipments) == 1:
-            shipment_data = st.session_state.shipments[0]
-            display_shipment(
-                shipment_data["shipment"],
-                shipment_data["attachment_name"],
-                1,
-                shipment_idx=0,
-                customer_id=_get_customer_id(shipment_data),
-            )
+        if not st.session_state.blob_emails:
+            st.warning("No .eml files found in Azure Blob Storage under 'sample-mails/'.")
         else:
-            tabs = st.tabs([
-                f"Shipment {idx}: {data['attachment_name']}"
-                for idx, data in enumerate(st.session_state.shipments, 1)
-            ])
-            for tab, (idx, shipment_data) in zip(tabs, enumerate(st.session_state.shipments)):
-                with tab:
-                    display_shipment(
-                        shipment_data["shipment"],
-                        shipment_data["attachment_name"],
-                        shipment_data["attachment_index"],
-                        shipment_idx=idx,
-                        customer_id=_get_customer_id(shipment_data),
-                    )
+            selected_blob = st.selectbox(
+                "Select an email from Azure Blob Storage to extract shipment information from attachments",
+                options=st.session_state.blob_emails,
+                format_func=lambda name: Path(name).name,
+            )
 
-        # Download button — exclude spam
-        downloadable = [
-            s for s in st.session_state.shipments
-            if s["shipment"].email_type != "spam"
-            and not _has_blocking_missing_fields(s["shipment"])
-        ]
-        if downloadable:
-            import zipfile
-            import io
+        # Process button (only when a blob is selected)
+        if selected_blob is not None:
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                process_button = st.button("Process Email", type="primary", use_container_width=True, key="process_email")
+
+            if process_button:
+                # Clear previous results (both tabs)
+                st.session_state.shipments = []
+                st.session_state.email_processed = False
+                st.session_state.email_data = None
+                st.session_state.envelope = None
+                st.session_state.source_breakdown = None
+                st.session_state.raw_cu_results = None
+                st.session_state.graph_shipments = []
+                st.session_state.graph_email_processed = False
+                st.session_state.graph_email_data = None
+
+                # Process email from Azure Blob Storage
+                with st.container():
+                    shipments_data = process_email_blob(selected_blob)
+
+                    if shipments_data:
+                        st.session_state.shipments = shipments_data
+                        st.session_state.email_processed = True
+                        st.success(f"Successfully processed {len(shipments_data)} shipments!")
+                    else:
+                        st.error("No shipments were extracted. Please check the email file and try again.")
+
+        # Display results
+        if st.session_state.email_processed and st.session_state.shipments:
+            st.divider()
+
+            # Raw Content Understanding JSON (before email preview)
+            if st.session_state.raw_cu_results:
+                raw_cu_json = json.dumps(st.session_state.raw_cu_results, indent=2)
+                with st.expander("View Raw JSON"):
+                    st.code(raw_cu_json, language="json")
+                st.download_button(
+                    label="Download Raw JSON",
+                    data=raw_cu_json,
+                    file_name="raw_content_understanding.json",
+                    mime="application/json",
+                    type="secondary",
+                )
+
+            # Email preview
+            if st.session_state.email_data:
+                with st.expander("Email Preview"):
+                    _display_email_preview(st.session_state.email_data)
+
+            # Normalized JSON (per-source structured breakdown)
+            if st.session_state.source_breakdown:
+                breakdown_json = json.dumps(st.session_state.source_breakdown, indent=2)
+                with st.expander("Normalized JSON"):
+                    st.code(breakdown_json, language="json")
+                st.download_button(
+                    label="Download Normalized JSON",
+                    data=breakdown_json,
+                    file_name="normalized_json.json",
+                    mime="application/json",
+                    type="secondary",
+                )
 
             st.divider()
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    body_shipments = [s for s in downloadable if s.get('is_body_shipment')]
-                    non_body_shipments = [s for s in downloadable if not s.get('is_body_shipment')]
 
-                    for idx, shipment_data in enumerate(non_body_shipments, 1):
-                        json_content = format_client_json_str(shipment_data["shipment"], customer_id=_get_customer_id(shipment_data))
-                        filename = f"shipment_{idx}_{Path(shipment_data['attachment_name']).stem}.json"
-                        zf.writestr(filename, json_content)
+            st.header("Extracted Shipments")
+            st.info(f"Found {len(st.session_state.shipments)} shipment(s)")
 
-                    if len(body_shipments) == 1:
-                        zf.writestr("shipment_email_body.json", format_client_json_str(body_shipments[0]["shipment"], customer_id=_get_customer_id(body_shipments[0])))
-                    elif len(body_shipments) > 1:
-                        combined = {
-                            f"shipment_{i+1}": json.loads(format_client_json_str(s["shipment"], customer_id=_get_customer_id(s)))
-                            for i, s in enumerate(body_shipments)
-                        }
-                        zf.writestr("shipment_email_body.json", json.dumps(combined, indent=2))
-
-                st.download_button(
-                    label="Download All Shipments (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="all_shipments.zip",
-                    mime="application/zip",
-                    type="secondary",
-                    use_container_width=True,
+            if len(st.session_state.shipments) == 1:
+                shipment_data = st.session_state.shipments[0]
+                display_shipment(
+                    shipment_data["shipment"],
+                    shipment_data["attachment_name"],
+                    1,
+                    shipment_idx=0,
+                    customer_id=_get_customer_id(shipment_data),
                 )
+            else:
+                tabs = st.tabs([
+                    f"Shipment {idx}: {data['attachment_name']}"
+                    for idx, data in enumerate(st.session_state.shipments, 1)
+                ])
+                for tab, (idx, shipment_data) in zip(tabs, enumerate(st.session_state.shipments)):
+                    with tab:
+                        display_shipment(
+                            shipment_data["shipment"],
+                            shipment_data["attachment_name"],
+                            shipment_data["attachment_index"],
+                            shipment_idx=idx,
+                            customer_id=_get_customer_id(shipment_data),
+                        )
+
+            # Download button — exclude spam
+            downloadable = [
+                s for s in st.session_state.shipments
+                if s["shipment"].email_type != "spam"
+                and not _has_blocking_missing_fields(s["shipment"])
+            ]
+            if downloadable:
+                import zipfile
+                import io
+
+                st.divider()
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                        body_shipments = [s for s in downloadable if s.get('is_body_shipment')]
+                        non_body_shipments = [s for s in downloadable if not s.get('is_body_shipment')]
+
+                        for idx, shipment_data in enumerate(non_body_shipments, 1):
+                            json_content = format_client_json_str(shipment_data["shipment"], customer_id=_get_customer_id(shipment_data))
+                            filename = f"shipment_{idx}_{Path(shipment_data['attachment_name']).stem}.json"
+                            zf.writestr(filename, json_content)
+
+                        if len(body_shipments) == 1:
+                            zf.writestr("shipment_email_body.json", format_client_json_str(body_shipments[0]["shipment"], customer_id=_get_customer_id(body_shipments[0])))
+                        elif len(body_shipments) > 1:
+                            combined = {
+                                f"shipment_{i+1}": json.loads(format_client_json_str(s["shipment"], customer_id=_get_customer_id(s)))
+                                for i, s in enumerate(body_shipments)
+                            }
+                            zf.writestr("shipment_email_body.json", json.dumps(combined, indent=2))
+
+                    st.download_button(
+                        label="Download All Shipments (ZIP)",
+                        data=zip_buffer.getvalue(),
+                        file_name="all_shipments.zip",
+                        mime="application/zip",
+                        type="secondary",
+                        use_container_width=True,
+                    )
 
 
 

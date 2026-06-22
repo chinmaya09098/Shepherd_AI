@@ -1,0 +1,709 @@
+"""
+Microsoft Graph API client.
+Python conversion of GraphTest/Services/Service.cs and GraphTest/Controllers/OutlookController.cs.
+
+Handles:
+  - OAuth authorization URL generation          (replaces Program.cs AddOpenIdConnect)
+  - Authorization code → token exchange         (replaces ASP.NET OIDC middleware)
+  - Access token refresh with 5-min threshold   (replaces Service.cs ValidateToken)
+  - Mail folder listing                          (replaces Service.cs GetUserMailFolders)
+  - Mail message reading with pagination         (replaces Service.cs GetUserMailsFromFolder)
+  - User profile fetch                           (replaces OutlookController.GetUserProfile)
+  - Reply sending within thread                  (new — required by SoW Section E)
+  - Attachment download                          (new — required by SoW Section A)
+"""
+import base64
+import json
+import os
+import re
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+import httpx
+
+from src.models.graph_models import (
+    EmailAddress,
+    EmailRecipient,
+    GraphConfig,
+    GraphToken,
+    InboxMessageSummary,
+    MailBody,
+    MailFlag,
+    MailFolder,
+    MailMessage,
+    ReadInboxResult,
+    UserProfile,
+)
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+LOGIN_BASE_URL = "https://login.microsoftonline.com"
+
+# OAuth scopes — matches GraphTest Program.cs options.Scope entries exactly
+OAUTH_SCOPES = [
+    "openid",
+    "profile",
+    "offline_access",
+    "email",
+    "Mail.Read",
+    "Mail.ReadBasic",
+    "Mail.Send",
+    "User.Read",
+]
+
+# Token refresh threshold — matches GraphTest Service.cs refreshThresholdMinutes = 5
+_REFRESH_THRESHOLD_MINUTES = 5
+
+
+class GraphClient:
+    """
+    Microsoft Graph API client for email ingestion and sending.
+
+    Usage:
+        config = GraphConfig(tenant_id=..., client_id=..., client_secret=..., redirect_uri=...)
+        client = GraphClient(config)
+
+        # Step 1 — get auth URL (one-time per tenant onboarding)
+        url = client.get_auth_url(state="add")
+        # Direct the mailbox owner to `url` in a browser
+
+        # Step 2 — exchange the returned code for tokens
+        token = await client.exchange_code_for_tokens(auth_code)
+
+        # Step 3 — read inbox (token auto-refreshed if near expiry)
+        token, messages = await client.read_inbox(token)
+    """
+
+    def __init__(self, config: GraphConfig):
+        self._config = config
+
+    # -------------------------------------------------------------------------
+    # OAuth — replaces Program.cs AddOpenIdConnect + OutlookController endpoints
+    # -------------------------------------------------------------------------
+
+    def get_auth_url(self, state: str = "add") -> str:
+        """
+        Build the Microsoft OAuth authorization URL.
+        Equivalent to the popup opened by index.html outlookSignIn():
+            window.open('/api/outlook/getOutlookAPIAccessToken/add')
+
+        The user visits this URL, logs in with their Microsoft account,
+        and is redirected back to redirect_uri with an authorization code.
+
+        Args:
+            state: 'add' for new tenant, 'update' for re-authorisation
+
+        Returns:
+            Full Microsoft login URL
+        """
+        params = {
+            "client_id": self._config.client_id,
+            "response_type": "code",
+            "redirect_uri": self._config.redirect_uri,
+            "response_mode": "query",
+            "scope": " ".join(OAUTH_SCOPES),
+            "state": state,
+        }
+        url = (
+            f"{LOGIN_BASE_URL}/{self._config.tenant_id}/oauth2/v2.0/authorize"
+            f"?{urllib.parse.urlencode(params)}"
+        )
+        logger.info("Generated auth URL for tenant %s", self._config.tenant_id)
+        return url
+
+    async def exchange_code_for_tokens(self, auth_code: str) -> GraphToken:
+        """
+        Exchange an authorization code for access + refresh tokens.
+        This is what ASP.NET Core's OIDC middleware performs automatically
+        after the browser redirects back from Microsoft login.
+
+        Equivalent to the token extraction in OutlookController.GetOutlookAPIAccessToken():
+            var accessToken  = await HttpContext.GetTokenAsync("AzureADOutlookAPI", "access_token")
+            var refreshToken = await HttpContext.GetTokenAsync("AzureADOutlookAPI", "refresh_token")
+            var expiresAt    = await HttpContext.GetTokenAsync("AzureADOutlookAPI", "expires_at")
+
+        Args:
+            auth_code: The 'code' query parameter from the OAuth redirect URI callback
+
+        Returns:
+            GraphToken containing access_token, refresh_token, expiration
+        """
+        token_url = f"{LOGIN_BASE_URL}/{self._config.tenant_id}/oauth2/v2.0/token"
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": self._config.client_id,
+            "client_secret": self._config.client_secret,
+            "code": auth_code,
+            "redirect_uri": self._config.redirect_uri,
+            "scope": " ".join(OAUTH_SCOPES),
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        expiration = datetime.now(timezone.utc) + timedelta(seconds=int(data["expires_in"]))
+        token = GraphToken(
+            access_token=data["access_token"],
+            refresh_token=data["refresh_token"],
+            expiration=expiration,
+        )
+        logger.info("Tokens obtained via authorization code exchange")
+        return token
+
+    async def validate_token(
+        self, token: GraphToken, force_refresh: bool = False
+    ) -> GraphToken:
+        """
+        Check if the access token is near expiry; refresh it if needed.
+        Direct conversion of Service.cs ValidateToken().
+
+        Refresh threshold: 5 minutes (matches GraphTest refreshThresholdMinutes = 5).
+        Stores the comment from GraphTest:
+            "We update the database with the updated token values and expiration here."
+        → In Shepherd, the caller is responsible for persisting the returned token to Key Vault.
+
+        Args:
+            token: Current GraphToken
+            force_refresh: Force a refresh regardless of remaining time
+
+        Returns:
+            Updated GraphToken — same object if still valid, new tokens if refreshed
+        """
+        try:
+            now = datetime.now(timezone.utc)
+
+            expiration = token.expiration
+            if expiration.tzinfo is None:
+                expiration = expiration.replace(tzinfo=timezone.utc)
+
+            time_remaining = expiration - now
+            refresh_threshold = timedelta(minutes=_REFRESH_THRESHOLD_MINUTES)
+
+            if time_remaining < refresh_threshold or force_refresh:
+                logger.info(
+                    "Access token expires in %.0f s — refreshing",
+                    max(time_remaining.total_seconds(), 0),
+                )
+                token = await self._do_refresh_token(token.refresh_token)
+                logger.info("Token refreshed successfully")
+            else:
+                logger.debug(
+                    "Access token valid for %.0f more seconds",
+                    time_remaining.total_seconds(),
+                )
+        except Exception as exc:
+            logger.error("Error in validate_token: %s", exc)
+
+        return token
+
+    async def _do_refresh_token(self, refresh_token: str) -> GraphToken:
+        """
+        POST to the Azure token endpoint to get new tokens using a refresh token.
+        Direct conversion of the HTTP POST inside Service.cs ValidateToken():
+
+            request.Content = new FormUrlEncodedContent(new Dictionary<string, string> {
+                ["grant_type"]    = "refresh_token",
+                ["client_id"]     = pClientId,
+                ["client_secret"] = clientSecret,
+                ["refresh_token"] = model.RefreshToken
+            });
+        """
+        token_url = f"{LOGIN_BASE_URL}/{self._config.tenant_id}/oauth2/v2.0/token"
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": self._config.client_id,
+            "client_secret": self._config.client_secret,
+            "refresh_token": refresh_token,
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        expiration = datetime.now(timezone.utc) + timedelta(seconds=int(data["expires_in"]))
+        return GraphToken(
+            access_token=data["access_token"],
+            refresh_token=data["refresh_token"],
+            expiration=expiration,
+        )
+
+    # -------------------------------------------------------------------------
+    # User profile — replaces OutlookController.GetUserProfile()
+    # -------------------------------------------------------------------------
+
+    async def get_user_profile(self, access_token: str) -> Optional[UserProfile]:
+        """
+        Fetch the signed-in user's id and userPrincipalName from Graph /me.
+        Direct conversion of OutlookController.GetUserProfile():
+
+            var response = await client.GetAsync("https://graph.microsoft.com/v1.0/me");
+            return await response.Content.ReadFromJsonAsync<UserProfile>();
+
+        Returns:
+            UserProfile with id and user_principal_name, or None on failure
+        """
+        url = f"{GRAPH_BASE_URL}/me"
+        response_text = await self._web_api_get(url, access_token)
+        if not response_text:
+            return None
+        try:
+            data = json.loads(response_text)
+            return UserProfile(
+                id=data.get("id", ""),
+                user_principal_name=data.get("userPrincipalName", ""),
+            )
+        except Exception as exc:
+            logger.error("Error parsing user profile: %s", exc)
+            return None
+
+    # -------------------------------------------------------------------------
+    # Mail folders — replaces Service.cs GetUserMailFolders()
+    # -------------------------------------------------------------------------
+
+    async def get_mail_folders(self, access_token: str) -> Optional[List[MailFolder]]:
+        """
+        List all mail folders including hidden ones.
+        Direct conversion of Service.cs GetUserMailFolders():
+
+            var response = await GetWebAPI(
+                "https://graph.microsoft.com/v1.0/me/mailFolders/?includeHiddenFolders=true",
+                authToken);
+            return JsonConvert.DeserializeObject<OAPIFolders>(response);
+
+        Returns:
+            List of MailFolder objects, or None on failure
+        """
+        url = f"{GRAPH_BASE_URL}/me/mailFolders/?includeHiddenFolders=true"
+        try:
+            response_text = await self._web_api_get(url, access_token)
+            if not response_text:
+                return None
+
+            data = json.loads(response_text)
+            folders = []
+            for f in data.get("value", []):
+                folders.append(
+                    MailFolder(
+                        id=f.get("id"),
+                        display_name=f.get("displayName"),
+                        parent_folder_id=f.get("parentFolderId"),
+                        child_folder_count=f.get("childFolderCount", 0),
+                        unread_item_count=f.get("unreadItemCount", 0),
+                        total_item_count=f.get("totalItemCount", 0),
+                        size_in_bytes=f.get("sizeInBytes", 0),
+                        is_hidden=f.get("isHidden", False),
+                    )
+                )
+            return folders
+        except Exception as exc:
+            logger.error("Error getting mail folders: %s", exc)
+            return None
+
+    async def get_inbox_folder_id(self, access_token: str) -> Optional[str]:
+        """
+        Convenience method: get the folder ID for the Inbox.
+        Mirrors the folder filtering in Service.cs ReadFromOutlookInbox():
+
+            var folderId = folders.value
+                .Where(f => f.displayName == "Inbox")
+                .Select(f => f.id)
+                .FirstOrDefault();
+        """
+        folders = await self.get_mail_folders(access_token)
+        if not folders:
+            return None
+        for folder in folders:
+            if folder.display_name == "Inbox":
+                return folder.id
+        logger.warning("Inbox folder not found in mail folders list")
+        return None
+
+    # -------------------------------------------------------------------------
+    # Mail messages — replaces Service.cs GetUserMailsFromFolder()
+    # -------------------------------------------------------------------------
+
+    async def get_mails_from_folder(
+        self,
+        access_token: str,
+        folder_id: str,
+        latest_message_time: Optional[datetime] = None,
+        top: int = 50,
+    ) -> List[MailMessage]:
+        """
+        Fetch emails from a specific mail folder with full pagination support.
+        Direct conversion of Service.cs GetUserMailsFromFolder().
+
+        Incremental sync: pass latest_message_time to only get new emails since
+        the last processed message. Mirrors the latestMessageTime comment in GraphTest:
+            "Here we get from our database the latest email message for the inbox..."
+
+        Pagination: follows @odata.nextLink until exhausted when filtering by date.
+        Mirrors the do-while loop in GraphTest:
+            do { ... url = nextLink; } while (isNextLinkHasValue);
+
+        Args:
+            access_token: Valid access token
+            folder_id: Mail folder ID (use get_inbox_folder_id() to get Inbox ID)
+            latest_message_time: Only fetch emails received after this datetime
+            top: Max results per page (default 50 matches GraphTest $top=50)
+
+        Returns:
+            Flat list of all MailMessage objects across all pages
+        """
+        select_fields = ",".join([
+            "id",
+            "internetMessageId",
+            "conversationId",
+            "createdDateTime",
+            "receivedDateTime",
+            "subject",
+            "body",
+            "from",
+            "toRecipients",
+            "ccRecipients",
+            "hasAttachments",
+            "isRead",
+        ])
+
+        filter_param = f"$top={top}"
+        is_filter_by_date = False
+
+        if latest_message_time:
+            is_filter_by_date = True
+            from src.utils.graph_utils import format_graph_datetime
+            dt_str = format_graph_datetime(latest_message_time)
+            filter_param += f"&$filter=(receivedDateTime gt {dt_str})"
+
+        url = (
+            f"{GRAPH_BASE_URL}/me/mailFolders/{folder_id}/messages"
+            f"?$select={select_fields}&{filter_param}"
+        )
+
+        # Request HTML body — mirrors GraphTest AdditionalApiHeader "Prefer"
+        extra_headers = {"Prefer": 'outlook.body-content-type="html"'}
+
+        all_messages: List[MailMessage] = []
+        has_next_page = True
+
+        while has_next_page:
+            try:
+                response_text = await self._web_api_get(url, access_token, extra_headers)
+                if not response_text:
+                    break
+
+                data = json.loads(response_text)
+                page_messages = data.get("value", [])
+                next_link = data.get("@odata.nextLink")
+
+                for m in page_messages:
+                    all_messages.append(self._parse_mail_message(m))
+
+                # Follow pagination only when filtering by date (matches GraphTest logic)
+                if is_filter_by_date and next_link:
+                    url = next_link
+                else:
+                    has_next_page = False
+
+            except Exception as exc:
+                logger.error("Error fetching mails from folder: %s", exc)
+                break
+
+        logger.info("Fetched %d messages from folder %s", len(all_messages), folder_id)
+        return all_messages
+
+    # -------------------------------------------------------------------------
+    # High-level inbox reader — replaces Service.cs ReadFromOutlookInbox()
+    # -------------------------------------------------------------------------
+
+    async def read_inbox(
+        self,
+        token: GraphToken,
+        latest_message_time: Optional[datetime] = None,
+    ) -> Tuple[GraphToken, List[MailMessage]]:
+        """
+        Validate token, find Inbox folder, return all messages.
+        Direct conversion of Service.cs ReadFromOutlookInbox().
+
+        Returns the updated token so the caller can persist any refreshed credentials.
+
+        Args:
+            token: Current GraphToken (may be refreshed internally)
+            latest_message_time: Only return emails after this datetime (incremental sync)
+
+        Returns:
+            (updated_token, list_of_MailMessage)
+        """
+        token = await self.validate_token(token)
+
+        folder_id = await self.get_inbox_folder_id(token.access_token)
+        if not folder_id:
+            logger.warning("Could not find Inbox folder — returning empty result")
+            return token, []
+
+        messages = await self.get_mails_from_folder(
+            token.access_token, folder_id, latest_message_time
+        )
+        return token, messages
+
+    def summarise_inbox(self, messages: List[MailMessage]) -> ReadInboxResult:
+        """
+        Convert a list of MailMessage objects into a ReadInboxResult summary.
+        Mirrors the summary construction at the end of Service.cs ReadFromOutlookInbox().
+        """
+        result = ReadInboxResult()
+        for msg in messages:
+            from_address = ""
+            if msg.from_ and msg.from_.email_address:
+                ea = msg.from_.email_address
+                from_address = ea.address or ""
+
+            result.messages.append(
+                InboxMessageSummary(
+                    subject=msg.subject,
+                    from_address=from_address,
+                    received_date_time=msg.received_date_time,
+                )
+            )
+        result.message_count = len(result.messages)
+        return result
+
+    # -------------------------------------------------------------------------
+    # Reply sending — new, required by SoW Section E (follow-up emails)
+    # Uses Mail.Send scope already declared in OAUTH_SCOPES
+    # -------------------------------------------------------------------------
+
+    async def send_reply(
+        self,
+        access_token: str,
+        message_id: str,
+        reply_body: str,
+        reply_html: bool = True,
+    ) -> bool:
+        """
+        Send a reply within the same email thread (conversation).
+        Required by SoW: 'Send responses within the same email thread.'
+
+        Uses Graph API: POST /v1.0/me/messages/{id}/reply
+        This preserves the conversationId and thread continuity.
+
+        Args:
+            access_token: Valid access token
+            message_id: Graph message ID of the email being replied to
+            reply_body: Reply content (HTML or plain text)
+            reply_html: True for HTML content type, False for plain text
+
+        Returns:
+            True on success (HTTP 202 Accepted), False otherwise
+        """
+        url = f"{GRAPH_BASE_URL}/me/messages/{message_id}/reply"
+        payload = {
+            "message": {
+                "body": {
+                    "contentType": "html" if reply_html else "text",
+                    "content": reply_body,
+                }
+            },
+            "comment": reply_body,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    content=json.dumps(payload),
+                )
+            if response.status_code == 202:
+                logger.info("Reply sent for message_id=%s", message_id)
+                return True
+            logger.error(
+                "Failed to send reply — status %s: %s",
+                response.status_code,
+                response.text,
+            )
+            return False
+        except Exception as exc:
+            logger.error("Error sending reply for message_id=%s: %s", message_id, exc)
+            return False
+
+    # -------------------------------------------------------------------------
+    # Attachment download — new, required by SoW Section A (attachment processing)
+    # -------------------------------------------------------------------------
+
+    async def download_attachments(
+        self,
+        access_token: str,
+        message_id: str,
+        save_dir: str,
+    ) -> List[Dict]:
+        """
+        Download all file attachments for a message and save them to disk.
+        Replaces EMLParser._extract_attachments() for Graph-sourced emails.
+        Returns the same list-of-dicts schema as EMLParser so the rest of
+        the Shepherd pipeline (ContentUnderstandingExtractor) works unchanged.
+
+        Output schema per attachment:
+            {filename, filepath, content_type, size}
+
+        Args:
+            access_token: Valid access token
+            message_id: Graph message ID
+            save_dir: Directory to save attachment files
+
+        Returns:
+            List of attachment metadata dicts
+        """
+        url = f"{GRAPH_BASE_URL}/me/messages/{message_id}/attachments"
+        response_text = await self._web_api_get(url, access_token)
+        if not response_text:
+            return []
+
+        data = json.loads(response_text)
+        os.makedirs(save_dir, exist_ok=True)
+        attachments = []
+
+        for att in data.get("value", []):
+            att_type = att.get("@odata.type", "")
+            filename = att.get("name", "unknown")
+            content_type = att.get("contentType", "application/octet-stream")
+            content_b64 = att.get("contentBytes")
+
+            # Only process file attachments — skip item/reference attachments
+            if "#microsoft.graph.fileAttachment" not in att_type:
+                continue
+            if not content_b64:
+                continue
+
+            filepath = os.path.join(save_dir, filename)
+            try:
+                content = base64.b64decode(content_b64)
+                with open(filepath, "wb") as f:
+                    f.write(content)
+
+                attachments.append({
+                    "filename": filename,
+                    "filepath": filepath,
+                    "content_type": content_type,
+                    "size": len(content),
+                })
+                logger.info("Downloaded attachment: %s (%d bytes)", filename, len(content))
+            except Exception as exc:
+                logger.error("Error saving attachment %s: %s", filename, exc)
+
+        return attachments
+
+    # -------------------------------------------------------------------------
+    # Internal HTTP helper — replaces Service.cs GetWebAPI()
+    # -------------------------------------------------------------------------
+
+    async def _web_api_get(
+        self,
+        url: str,
+        access_token: str,
+        additional_headers: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Authenticated GET request to any Graph API URL.
+        Direct conversion of Service.cs GetWebAPI():
+
+            client.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", authToken);
+            var response = await client.SendAsync(request, ...);
+            if (response.StatusCode == HttpStatusCode.OK) return strResponse;
+            throw new Exception(strResponse);
+
+        Returns:
+            Response body as string, or empty string on failure
+        """
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            if additional_headers:
+                headers.update(additional_headers)
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers)
+
+            if response.status_code == 200:
+                return response.text
+
+            logger.error(
+                "Graph API %s returned %s: %s", url, response.status_code, response.text
+            )
+            raise Exception(
+                f"Graph API returned {response.status_code}: {response.text}"
+            )
+        except Exception as exc:
+            logger.error("Error calling Graph API %s: %s", url, exc)
+
+        return ""
+
+    # -------------------------------------------------------------------------
+    # Internal parser — converts raw Graph API JSON to MailMessage dataclass
+    # -------------------------------------------------------------------------
+
+    def _parse_mail_message(self, data: Dict) -> MailMessage:
+        """
+        Convert a raw Graph API message dict to a MailMessage dataclass.
+        Mirrors the field mappings from Service.cs OAPIValue class.
+        """
+
+        def parse_dt(val: Optional[str]) -> Optional[datetime]:
+            if not val:
+                return None
+            try:
+                return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        def parse_recipient(r: Optional[Dict]) -> Optional[EmailRecipient]:
+            if not r:
+                return None
+            ea = r.get("emailAddress", {})
+            return EmailRecipient(
+                email_address=EmailAddress(
+                    name=ea.get("name"),
+                    address=ea.get("address"),
+                )
+            )
+
+        body_raw = data.get("body", {})
+        flag_raw = data.get("flag", {})
+
+        return MailMessage(
+            id=data.get("id"),
+            internet_message_id=data.get("internetMessageId"),
+            conversation_id=data.get("conversationId"),
+            created_date_time=parse_dt(data.get("createdDateTime")),
+            received_date_time=parse_dt(data.get("receivedDateTime")),
+            sent_date_time=parse_dt(data.get("sentDateTime")),
+            subject=data.get("subject"),
+            body_preview=data.get("bodyPreview"),
+            importance=data.get("importance"),
+            parent_folder_id=data.get("parentFolderId"),
+            conversation_index=data.get("conversationIndex"),
+            is_read=data.get("isRead", False),
+            is_draft=bool(data.get("isDraft", False)),
+            web_link=data.get("webLink"),
+            has_attachments=bool(data.get("hasAttachments", False)),
+            body=MailBody(
+                content_type=body_raw.get("contentType"),
+                content=body_raw.get("content"),
+            ) if body_raw else None,
+            from_=parse_recipient(data.get("from")),
+            sender=parse_recipient(data.get("sender")),
+            to_recipients=[
+                r for r in (parse_recipient(x) for x in data.get("toRecipients", [])) if r
+            ],
+            cc_recipients=[
+                r for r in (parse_recipient(x) for x in data.get("ccRecipients", [])) if r
+            ],
+            flag=MailFlag(flag_status=flag_raw.get("flagStatus")) if flag_raw else None,
+        )
