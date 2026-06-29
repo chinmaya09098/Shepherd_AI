@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #222; line-height: 1.6; margin: 0; padding: 0; }
+  .container { max-width: 600px; margin: 0 auto; padding: 24px; }
+  .header { border-bottom: 2px solid #6b7280; padding-bottom: 12px; margin-bottom: 20px; }
+  .header h2 { margin: 0; color: #374151; font-size: 1.2rem; }
+  .badge { display: inline-block; background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; border-radius: 20px; padding: 4px 14px; font-weight: 600; font-size: 0.9rem; margin-bottom: 16px; }
+  .footer { border-top: 1px solid #e5e7eb; padding-top: 16px; margin-top: 24px; color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h2>Request Received — {{ subject }}</h2>
+  </div>
+
+  <div class="badge">Request Received</div>
+
+  <p>Thank you for contacting 3PL Systems.</p>
+
+  <p>We have received your message regarding <strong>{{ subject }}</strong> and it is currently being reviewed by our team.</p>
+
+  <p>A member of our operations team will respond to you shortly.</p>
+
+  <p>We appreciate your patience.<br>
+  <strong>Shepherd AI — 3PL Systems Operations Team</strong></p>
+
+  <div class="footer">
+    This is an automated acknowledgment from the Shepherd AI shipment management system.
+    Please reply to this email if you have any questions.
+  </div>
+</div>
+</body>
+</html>

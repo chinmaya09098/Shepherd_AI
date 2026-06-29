@@ -8,6 +8,17 @@ openai>=1.10.0
 azure-ai-documentintelligence>=1.0.0b1  # For Azure Content Understanding
 azure-storage-blob>=12.19.0  # For Azure Blob Storage integration
 
+# Azure Table & Queue Storage (state, dedup, review queue, audit log)
+azure-data-tables>=12.5.0
+azure-storage-queue>=12.6.0
+
+# Azure Key Vault (Graph token persistence, secret management)
+azure-keyvault-secrets>=4.7.0
+azure-identity>=1.16.0         # DefaultAzureCredential + ManagedIdentity
+
+# Azure Functions runtime (used by function_app/)
+azure-functions>=1.18.0
+
 # Email parsing
 email-validator>=2.0.0
 
@@ -18,8 +29,18 @@ openpyxl>=3.1.0  # For reading .xlsx files
 # Azure AI Search
 azure-search-documents>=11.4.0
 
+# Jinja2 HTML email templates
+jinja2>=3.1.0
+
+# Application Insights telemetry (optional — disabled when key not set)
+opencensus-ext-azure>=1.1.13
+
 # Logging and utilities
 python-dateutil>=2.8.2
+
+# Webhook receiver API
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
 
 # UI
 streamlit>=1.28.0

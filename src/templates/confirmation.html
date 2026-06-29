@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #222; line-height: 1.6; margin: 0; padding: 0; }
+  .container { max-width: 600px; margin: 0 auto; padding: 24px; }
+  .header { border-bottom: 2px solid #16a34a; padding-bottom: 12px; margin-bottom: 20px; }
+  .header h2 { margin: 0; color: #16a34a; font-size: 1.2rem; }
+  .badge { display: inline-block; background: #dcfce7; color: #16a34a; border: 1px solid #86efac; border-radius: 20px; padding: 4px 14px; font-weight: 600; font-size: 0.9rem; margin-bottom: 16px; }
+  .details-table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  .details-table td { padding: 8px 12px; border-bottom: 1px solid #f3f4f6; }
+  .details-table td:first-child { font-weight: 600; color: #555; width: 40%; }
+  .footer { border-top: 1px solid #e5e7eb; padding-top: 16px; margin-top: 24px; color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h2>Shipment Confirmed — {{ subject }}</h2>
+  </div>
+
+  <div class="badge">✓ Booking Confirmed</div>
+
+  <p>Dear {{ customer_name or 'Valued Customer' }},</p>
+  <p>Your shipment has been <strong>successfully booked</strong> in our system. Below is a summary of the confirmed details:</p>
+
+  <table class="details-table">
+    {% if pickup %}
+    <tr><td>Pickup Location</td><td>{{ pickup }}</td></tr>
+    {% endif %}
+    {% if delivery %}
+    <tr><td>Delivery Location</td><td>{{ delivery }}</td></tr>
+    {% endif %}
+    {% if pickup_date %}
+    <tr><td>Pickup Date</td><td>{{ pickup_date }}</td></tr>
+    {% endif %}
+    {% if delivery_date %}
+    <tr><td>Delivery Date</td><td>{{ delivery_date }}</td></tr>
+    {% endif %}
+    {% if equipment %}
+    <tr><td>Equipment / Mode</td><td>{{ equipment }}</td></tr>
+    {% endif %}
+  </table>
+
+  <p>Our operations team will be in touch with driver assignment and tracking details closer to the pickup date.</p>
+
+  <p>Thank you for choosing 3PL Systems.<br>
+  <strong>Shepherd AI — 3PL Systems Operations Team</strong></p>
+
+  <div class="footer">
+    This is an automated booking confirmation from the Shepherd AI shipment management system.
+    Please reply to this email if you have any questions or need to make changes.
+  </div>
+</div>
+</body>
+</html>

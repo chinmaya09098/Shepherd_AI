@@ -154,3 +154,4 @@ class UserProfile:
     """
     id: str = ""
     user_principal_name: str = ""
+    mail: str = ""  # Primary SMTP address — may differ from UPN for AD accounts

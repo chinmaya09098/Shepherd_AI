@@ -106,6 +106,114 @@ class GraphEmailReader:
         )
         return token, email_dicts
 
+    async def read_user_inbox_emails(
+        self,
+        access_token: str,
+        mailbox_upn: str,
+        latest_message_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        """
+        Read inbox for a specific mailbox using an app-only access token.
+        No user sign-in required — uses /users/{mailbox_upn}/ Graph endpoints.
+
+        Args:
+            access_token:        App-only token from GraphClient.get_app_only_token()
+            mailbox_upn:         Target mailbox, e.g. 'loads@company.com'
+            latest_message_time: Incremental sync — only emails after this datetime
+
+        Returns:
+            List of EMLParser-compatible email dicts
+        """
+        messages = await self._client.read_user_inbox(
+            access_token, mailbox_upn, latest_message_time
+        )
+
+        email_dicts = []
+        for message in messages:
+            email_dict = await self._convert_user_message(
+                access_token, mailbox_upn, message
+            )
+            if email_dict:
+                email_dicts.append(email_dict)
+
+        logger.info(
+            "GraphEmailReader (app-only): converted %d messages for %s",
+            len(email_dicts), mailbox_upn,
+        )
+        return email_dicts
+
+    async def read_single_user_email(
+        self,
+        access_token: str,
+        mailbox_upn: str,
+        message: MailMessage,
+    ) -> Optional[Dict]:
+        """
+        Convert a single MailMessage using app-only token.
+        Downloads attachments via /users/{mailbox_upn}/ endpoint.
+        """
+        return await self._convert_user_message(access_token, mailbox_upn, message)
+
+    async def _convert_user_message(
+        self,
+        access_token: str,
+        mailbox_upn: str,
+        message: MailMessage,
+    ) -> Optional[Dict]:
+        """
+        Convert a MailMessage using app-only token.
+        Downloads attachments via /users/{mailbox_upn}/messages/{id}/attachments.
+        """
+        try:
+            from_str = self._format_recipient(message.from_)
+            to_str = "; ".join(
+                self._format_recipient(r) for r in (message.to_recipients or [])
+                if r and r.email_address
+            )
+            date_str = (
+                message.received_date_time.isoformat()
+                if message.received_date_time
+                else ""
+            )
+            plain_body, html_body = self._extract_body(message)
+
+            attachments = []
+            if message.has_attachments and message.id:
+                att_dir = str(
+                    self._output_dir
+                    / "attachments"
+                    / (message.conversation_id or message.id or "unknown")
+                )
+                raw_attachments = await self._client.download_user_attachments(
+                    access_token, mailbox_upn, message.id, att_dir
+                )
+                attachments = [
+                    a for a in raw_attachments
+                    if Path(a["filename"]).suffix.lower() not in self._IMAGE_EXTENSIONS
+                ]
+
+            return {
+                "subject": message.subject or "",
+                "from": from_str,
+                "to": to_str,
+                "date": date_str,
+                "body": plain_body,
+                "html_body": html_body,
+                "attachments": attachments,
+                "message_id": message.id or "",
+                "conversation_id": message.conversation_id or "",
+                "internet_message_id": message.internet_message_id or "",
+                "is_read": message.is_read,
+                "has_attachments": message.has_attachments,
+                "received_date_time": message.received_date_time,
+            }
+
+        except Exception as exc:
+            logger.error(
+                "Error converting user message %s: %s", message.id, exc
+            )
+            return None
+
     async def read_single_email(
         self,
         token: GraphToken,

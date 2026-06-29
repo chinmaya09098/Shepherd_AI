@@ -1,0 +1,39 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "<your-storage-connection-string>",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+
+    "AZURE_OPENAI_ENDPOINT": "<your-azure-openai-endpoint>",
+    "AZURE_OPENAI_KEY": "<your-azure-openai-key>",
+    "AZURE_OPENAI_DEPLOYMENT": "<your-deployment-name>",
+    "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
+    "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": "<your-embedding-deployment>",
+
+    "AZURE_CONTENT_UNDERSTANDING_ENDPOINT": "<your-cu-endpoint>",
+    "AZURE_CONTENT_UNDERSTANDING_KEY": "<your-cu-key>",
+
+    "AZURE_STORAGE_CONNECTION_STRING": "<your-storage-connection-string>",
+    "AZURE_STORAGE_CONTAINER_NAME": "sample-mails",
+    "AZURE_STORAGE_OUTPUT_CONTAINER": "output-json",
+    "AZURE_STORAGE_LOGS_CONTAINER": "processed-logs",
+    "AZURE_STORAGE_QUEUE_NAME": "shepherd-email-queue",
+
+    "AZURE_SEARCH_ENDPOINT": "<your-search-endpoint>",
+    "AZURE_SEARCH_KEY": "<your-search-key>",
+    "AZURE_SEARCH_INDEX_NAME": "customer-contacts",
+
+    "AZURE_KEY_VAULT_URL": "<your-keyvault-url>",
+
+    "AZURE_AD_TENANT_ID": "<your-tenant-id>",
+    "AZURE_AD_CLIENT_ID": "<your-client-id>",
+    "AZURE_AD_CLIENT_SECRET": "<your-client-secret>",
+    "GRAPH_REDIRECT_URI": "http://localhost:8501",
+    "GRAPH_NOTIFICATION_URL": "<your-function-app-webhook-url>",
+
+    "APPINSIGHTS_CONNECTION_STRING": "<your-appinsights-connection-string>",
+
+    "OUTPUT_DIR": "output"
+  }
+}

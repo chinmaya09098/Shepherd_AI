@@ -67,8 +67,12 @@ if 'graph_connected' not in st.session_state:
     st.session_state.graph_connected = False
 if 'graph_user' not in st.session_state:
     st.session_state.graph_user = None
+if 'graph_mail' not in st.session_state:
+    st.session_state.graph_mail = None  # Real SMTP address (may differ from UPN)
 if 'graph_messages' not in st.session_state:
     st.session_state.graph_messages = []
+if 'graph_auto_load' not in st.session_state:
+    st.session_state.graph_auto_load = False
 if 'graph_shipments' not in st.session_state:
     st.session_state.graph_shipments = []
 if 'graph_email_processed' not in st.session_state:
@@ -637,6 +641,21 @@ def run_async(coro):
             return future.result()
 
 
+def _save_tokens_to_env(token: GraphToken) -> None:
+    """Persist Graph tokens to .env so they survive Streamlit restarts."""
+    from dotenv import set_key
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        set_key(str(env_path), "GRAPH_ACCESS_TOKEN", token.access_token or "")
+        set_key(str(env_path), "GRAPH_REFRESH_TOKEN", token.refresh_token or "")
+        expiry = token.expiration.isoformat() if token.expiration else ""
+        set_key(str(env_path), "GRAPH_TOKEN_EXPIRATION", expiry)
+    except Exception as e:
+        logger.warning("Could not save tokens to .env: %s", e)
+
+
 def _init_graph_client() -> Optional[GraphClient]:
     """Create a GraphClient from Config. Returns None if Graph API is not configured."""
     if not all([Config.AZURE_AD_TENANT_ID, Config.AZURE_AD_CLIENT_ID, Config.AZURE_AD_CLIENT_SECRET]):
@@ -858,32 +877,21 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
 
 
 def _render_graph_tab():
-    """Render the Live Mailbox (Microsoft Graph) tab content."""
+    """
+    Render the Live Mailbox (Microsoft Graph) tab.
 
-    # ── Handle OAuth callback (Microsoft redirects back with ?code=...) ──────
-    params = st.query_params
-    auth_code = params.get("code")
-    auth_state = params.get("state")
+    Supports two authentication modes:
 
-    if auth_code and auth_state in ("add", "update") and not st.session_state.graph_connected:
-        client = _init_graph_client()
-        if client:
-            with st.spinner("Completing Microsoft sign-in..."):
-                try:
-                    token = run_async(client.exchange_code_for_tokens(auth_code))
-                    user_profile = run_async(client.get_user_profile(token.access_token))
-                    st.session_state.graph_token = token
-                    st.session_state.graph_connected = True
-                    st.session_state.graph_user = (
-                        user_profile.user_principal_name if user_profile else "Unknown"
-                    )
-                    st.query_params.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Microsoft sign-in failed: {e}")
-                    logger.error(f"Graph OAuth callback error: {e}", exc_info=True)
-                    st.query_params.clear()
-                    return
+    1. APP-ONLY (production, recommended):
+       GRAPH_MAILBOX_UPN is set in .env → app authenticates using client credentials
+       (no user sign-in required). Reads the specified mailbox directly via
+       /users/{mailbox_upn}/ endpoints. Requires Mail.Read Application permission.
+
+    2. DELEGATED (interactive sign-in):
+       No GRAPH_MAILBOX_UPN set → user signs in via OAuth.
+       Reads signed-in user's own mailbox via /me/ endpoints.
+       Equivalent to GraphTest delegated OAuth flow.
+    """
 
     # ── Check Graph API configuration ─────────────────────────────────────────
     graph_configured = all([
@@ -896,86 +904,240 @@ def _render_graph_tab():
         st.warning(
             "Microsoft Graph API credentials are not configured. "
             "Add **AZURE_AD_TENANT_ID**, **AZURE_AD_CLIENT_ID**, and **AZURE_AD_CLIENT_SECRET** "
-            "to your `.env` file to enable live mailbox access."
+            "to your `.env` file."
         )
         with st.expander("Configuration guide"):
             st.markdown("""
-**Required `.env` variables:**
+**For App-Only mode (production — no sign-in required):**
+
+Add to `.env`:
 ```
-AZURE_AD_TENANT_ID=<your Azure AD tenant ID>
-AZURE_AD_CLIENT_ID=<App Registration client/application ID>
-AZURE_AD_CLIENT_SECRET=<App Registration client secret>
-GRAPH_REDIRECT_URI=http://localhost:8501
+GRAPH_MAILBOX_UPN=dispatch@3plsystems.com
 ```
 
-**Steps:**
-1. Create an App Registration in Azure Active Directory
-2. Add Delegated permissions: `Mail.Read`, `Mail.ReadWrite`, `Mail.Send`, `User.Read`
-3. Grant admin consent for the permissions
-4. Add `http://localhost:8501` as a Redirect URI (Web platform)
-5. Copy the Tenant ID, Client ID, and Client Secret into `.env`
+**API Permissions → Application** (in Azure App Registration):
+- `Mail.Read` — read emails and attachments
+- `Mail.ReadBasic` — read basic mail metadata
+- `Mail.Send` — send emails (optional for app-only)
+
+**API Permissions → Delegated** (for interactive sign-in fallback):
+- `Mail.Read`, `Mail.ReadBasic`, `Mail.Send`, `User.Read`
+- `openid`, `profile`, `email`, `offline_access`
+
+**Authentication → Web Redirect URI:** `http://localhost:8501`
 """)
         return
 
     client = _init_graph_client()
 
-    # ── Not connected: show Sign In button ────────────────────────────────────
-    if not st.session_state.graph_connected:
-        st.info(
-            "Connect your Microsoft mailbox to read live emails directly. "
-            "You will be redirected to Microsoft's sign-in page and returned here after authentication."
-        )
-        st.markdown(
-            "**Redirect URI** (must be registered in your Azure App Registration as a Web redirect URI):"
-        )
-        st.code(Config.GRAPH_REDIRECT_URI, language=None)
+    # ── APP-ONLY MODE — auto-connect using client credentials ──────────────────
+    # When GRAPH_MAILBOX_UPN is set, skip OAuth entirely.
+    # App authenticates as itself and reads the specified mailbox directly.
+    if Config.GRAPH_MAILBOX_UPN and not st.session_state.graph_connected:
+        with st.spinner(f"Connecting to mailbox {Config.GRAPH_MAILBOX_UPN}..."):
+            try:
+                app_token = run_async(client.get_app_only_token())
+                st.session_state.graph_token = app_token          # store raw token string
+                st.session_state.graph_connected = True
+                st.session_state.graph_user = f"App-Only: {Config.GRAPH_MAILBOX_UPN}"
+                st.session_state.graph_auto_load = True
+            except Exception as e:
+                st.error(
+                    f"App-only authentication failed: {e}\n\n"
+                    "Check that **Mail.Read Application permission** is granted in Azure AD."
+                )
+                logger.error("App-only auth failed: %s", e, exc_info=True)
+                return
 
+    # ── Step 1: Try loading pre-stored tokens from config (.env Tokens section)
+    # Mirrors Service.cs GetGraphModel() fallback when no params are passed:
+    #   AccessToken  = _configuration["Tokens:AccessToken"]
+    #   RefreshToken = _configuration["Tokens:RefreshToken"]
+    #   Expiration   = _configuration["Tokens:Expiration"]
+    if not st.session_state.graph_connected:
+        config_token = client.get_token_from_config()
+        if config_token:
+            with st.spinner("Loading tokens from configuration..."):
+                try:
+                    # Mirrors ValidateToken() — refresh if near expiry
+                    updated_token = run_async(client.validate_token(config_token))
+                    user_profile = run_async(
+                        client.get_user_profile(updated_token.access_token)
+                    )
+                    st.session_state.graph_token = updated_token
+                    st.session_state.graph_connected = True
+                    st.session_state.graph_user = (
+                        user_profile.user_principal_name if user_profile else "Config Token"
+                    )
+                    st.session_state.graph_mail = (
+                        user_profile.mail if user_profile and user_profile.mail else None
+                    )
+                    st.session_state.graph_auto_load = True   # auto-load inbox on next render
+                    _save_tokens_to_env(updated_token)        # update .env with refreshed token
+                except Exception as e:
+                    logger.warning("Config token load failed, falling back to OAuth: %s", e)
+
+    # ── Step 2: Handle OAuth callback — equivalent to GetOutlookAPIAccessToken()
+    # GraphTest uses a popup + window.postMessage(); Streamlit uses st.query_params
+    # to receive the ?code= redirect from Microsoft.
+    params = st.query_params
+    auth_code = params.get("code")
+    auth_state = params.get("state")
+
+    if auth_code and auth_state in ("add", "update") and not st.session_state.graph_connected:
+        with st.spinner("Completing Microsoft sign-in..."):
+            try:
+                # exchange_code_for_tokens — equivalent to the token extraction in
+                # GetOutlookAPIAccessToken() via HttpContext.GetTokenAsync()
+                token = run_async(client.exchange_code_for_tokens(auth_code))
+
+                # GetUserProfile — mirrors OutlookController.GetUserProfile()
+                user_profile = run_async(client.get_user_profile(token.access_token))
+
+                # Store — mirrors the data sent via window.postMessage():
+                #   AccessToken, RefreshToken, Expiration, UserId, UserPrincipalName
+                st.session_state.graph_token = token
+                st.session_state.graph_connected = True
+                st.session_state.graph_user = (
+                    user_profile.user_principal_name if user_profile else "Unknown"
+                )
+                st.session_state.graph_mail = (
+                    user_profile.mail if user_profile and user_profile.mail else None
+                )
+                st.session_state.graph_auto_load = True   # auto-load inbox on next render
+                _save_tokens_to_env(token)               # persist so restart skips sign-in
+                st.query_params.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Microsoft sign-in failed: {e}")
+                logger.error("Graph OAuth callback error: %s", e, exc_info=True)
+                st.query_params.clear()
+                return
+
+    # ── Step 3: Not connected — show Sign In button
+    # Mirrors index.html outlookSignIn() which opens popup to:
+    #   /api/outlook/getOutlookAPIAccessToken/add
+    # In Streamlit we navigate the same tab (no popup support).
+    if not st.session_state.graph_connected:
         auth_url = client.get_auth_url(state="add")
         st.markdown(
-            f'<a href="{auth_url}" target="_self" style="display:inline-block;padding:10px 22px;'
-            f'background-color:#0078d4;color:white;text-decoration:none;border-radius:6px;'
-            f'font-weight:600;font-size:0.95rem;">Sign in with Microsoft</a>',
+            f'<a href="{auth_url}" target="_self" style="display:inline-block;'
+            f'padding:10px 22px;background-color:#0078d4;color:white;'
+            f'text-decoration:none;border-radius:6px;font-weight:600;font-size:0.95rem;">'
+            f'Sign in with Microsoft</a>',
             unsafe_allow_html=True,
         )
         return
 
-    # ── Connected ─────────────────────────────────────────────────────────────
+    # ── Step 4: Connected — show status and inbox controls
     col_status, col_disconnect = st.columns([4, 1])
     with col_status:
-        st.success(f"Connected as: **{st.session_state.graph_user}**")
+        connected_label = f"Connected as: **{st.session_state.graph_user}**"
+        if st.session_state.graph_mail and st.session_state.graph_mail != st.session_state.graph_user:
+            connected_label += f"  |  Jack should send emails to: **{st.session_state.graph_mail}**"
+        st.success(connected_label)
     with col_disconnect:
         if st.button("Disconnect", key="graph_disconnect"):
+            # Mirrors the sign-out flow — clear all stored token state
             st.session_state.graph_token = None
             st.session_state.graph_connected = False
             st.session_state.graph_user = None
+            st.session_state.graph_mail = None
             st.session_state.graph_messages = []
             st.session_state.graph_shipments = []
             st.session_state.graph_email_processed = False
             st.session_state.graph_email_data = None
+            st.session_state.graph_auto_load = False
             st.rerun()
 
-    # Load inbox
+    # ── Step 5: Load inbox
+    # Mirrors POST /api/outlook/readFromMailbox → Service.ReadFromOutlookInbox()
+    # which calls ValidateToken → GetUserMailFolders → GetUserMailsFromFolder
+    # Auto-loads immediately after sign-in (same as GraphTest ReadFromOutlookInbox on login)
     col_load, _ = st.columns([1, 4])
     with col_load:
         load_inbox = st.button(
-            "Load Inbox", type="primary", key="graph_load_inbox", use_container_width=True
+            "Refresh Inbox", type="primary", key="graph_load_inbox", use_container_width=True
         )
 
-    if load_inbox:
+    # Auto-load on first render after sign-in — matches GraphTest behaviour
+    if load_inbox or st.session_state.graph_auto_load:
         with st.spinner("Loading inbox emails..."):
             try:
-                updated_token, messages = run_async(
-                    client.read_inbox(st.session_state.graph_token)
-                )
-                st.session_state.graph_token = updated_token
+                # APP-ONLY MODE: token is a plain string, read specific mailbox
+                if Config.GRAPH_MAILBOX_UPN and isinstance(st.session_state.graph_token, str):
+                    # Refresh app-only token (client credentials — always fresh)
+                    app_token = run_async(client.get_app_only_token())
+                    st.session_state.graph_token = app_token
+                    messages = run_async(
+                        client.read_user_inbox(
+                            access_token=app_token,
+                            mailbox_upn=Config.GRAPH_MAILBOX_UPN,
+                            include_junk=True,   # also check Junk Email during testing
+                        )
+                    )
+                else:
+                    # DELEGATED MODE: token is a GraphToken object, read /me/ inbox
+                    # read_inbox() = ReadFromOutlookInbox():
+                    #   ValidateToken → GetUserMailFolders → GetUserMailsFromFolder
+                    updated_token, messages = run_async(
+                        client.read_inbox(st.session_state.graph_token)
+                    )
+                    st.session_state.graph_token = updated_token   # persist refreshed token
+
                 st.session_state.graph_messages = messages
+                st.session_state.graph_auto_load = False
                 if messages:
                     st.success(f"Loaded {len(messages)} email(s) from inbox")
                 else:
                     st.info("Inbox is empty or no new messages found.")
+                    # When running app-only, look up the real SMTP address so the
+                    # user knows exactly what address to give Jack (or any sender).
+                    if Config.GRAPH_MAILBOX_UPN and isinstance(st.session_state.graph_token, str):
+                        try:
+                            mailbox_info = run_async(
+                                client.get_mailbox_smtp_address(
+                                    access_token=st.session_state.graph_token,
+                                    mailbox_upn=Config.GRAPH_MAILBOX_UPN,
+                                )
+                            )
+                            real_smtp = mailbox_info.get("primary_smtp")
+                            proxy_list = [
+                                a for a in mailbox_info.get("proxy_addresses", [])
+                                if a.lower().startswith("smtp:")
+                            ]
+                            if mailbox_info.get("needs_permission"):
+                                st.warning(
+                                    f"**Cannot look up the real SMTP address** — "
+                                    f"`User.Read.All` Application permission is missing.\n\n"
+                                    f"To fix, ask your Azure admin to:\n"
+                                    f"1. Go to **Azure Portal → App Registrations → "
+                                    f"your app → API Permissions**\n"
+                                    f"2. Add **Microsoft Graph → Application → "
+                                    f"`User.Read.All`**\n"
+                                    f"3. Click **Grant admin consent**\n\n"
+                                    f"Until then, check Exchange Admin Center or ask your "
+                                    f"M365 admin for the real SMTP address of "
+                                    f"`{Config.GRAPH_MAILBOX_UPN}`."
+                                )
+                            elif real_smtp:
+                                st.warning(
+                                    f"**Senders should email:** `{real_smtp}`\n\n"
+                                    f"The configured UPN `{Config.GRAPH_MAILBOX_UPN}` is an "
+                                    f"internal AD address — external email won't be delivered "
+                                    f"to it. Tell Jack (and any other sender) to use "
+                                    f"**{real_smtp}** instead."
+                                )
+                            elif proxy_list:
+                                st.warning(
+                                    f"No primary SMTP found. Proxy addresses on this mailbox:\n\n"
+                                    + "\n".join(f"- `{a}`" for a in proxy_list)
+                                )
+                        except Exception as _diag_err:
+                            logger.debug("Could not fetch mailbox SMTP info: %s", _diag_err)
             except Exception as e:
                 st.error(f"Failed to load inbox: {e}")
-                logger.error(f"Graph inbox load error: {e}", exc_info=True)
+                logger.error("Graph inbox load error: %s", e, exc_info=True)
 
     # ── Email list and processing ─────────────────────────────────────────────
     if st.session_state.graph_messages:
@@ -1011,7 +1173,7 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             )
 
         if process_graph_btn:
-            # Clear previous results (both graph and blob tabs)
+            # Clear previous results
             st.session_state.graph_shipments = []
             st.session_state.graph_email_processed = False
             st.session_state.graph_email_data = None
@@ -1027,10 +1189,15 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                 with st.spinner("Downloading email and attachments from Graph API..."):
                     try:
                         reader = GraphEmailReader(client, attachment_output_dir=Config.OUTPUT_DIR)
+                        # read_single_email mirrors GetUserMailsFromFolder for one message:
+                        # validates token then downloads body + attachments via /me/ endpoints
                         updated_token, email_data = run_async(
-                            reader.read_single_email(st.session_state.graph_token, selected_message)
+                            reader.read_single_email(
+                                st.session_state.graph_token,
+                                selected_message,
+                            )
                         )
-                        st.session_state.graph_token = updated_token
+                        st.session_state.graph_token = updated_token  # persist refreshed token
                     except Exception as e:
                         st.error(f"Failed to download email from Graph API: {e}")
                         logger.error(f"Graph email download error: {e}", exc_info=True)

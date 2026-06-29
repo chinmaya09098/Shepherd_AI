@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #222; line-height: 1.6; margin: 0; padding: 0; }
+  .container { max-width: 600px; margin: 0 auto; padding: 24px; }
+  .header { border-bottom: 2px solid #0078d4; padding-bottom: 12px; margin-bottom: 20px; }
+  .header h2 { margin: 0; color: #0078d4; font-size: 1.2rem; }
+  .missing-list { background: #fff8e1; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+  .missing-list li { margin: 6px 0; }
+  .footer { border-top: 1px solid #e5e7eb; padding-top: 16px; margin-top: 24px; color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h2>Additional Information Required — {{ subject }}</h2>
+  </div>
+
+  <p>Thank you for submitting your shipment request. We have received your email and begun processing it.</p>
+
+  <p>To complete your booking, we require the following information:</p>
+
+  <div class="missing-list">
+    <ul>
+      {% for item in missing_items %}
+      <li><strong>{{ item }}</strong></li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <p>Please <strong>reply to this email</strong> with the missing details. Once we receive your response, we will finalise the booking and confirm with you promptly.</p>
+
+  <p>If you have any questions, please do not hesitate to reach out.</p>
+
+  <p>Thank you,<br>
+  <strong>Shepherd AI — 3PL Systems Operations Team</strong></p>
+
+  <div class="footer">
+    This is an automated message from the Shepherd AI shipment management system.
+    Please reply directly to this email thread to continue.
+  </div>
+</div>
+</body>
+</html>

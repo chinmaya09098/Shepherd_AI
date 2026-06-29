@@ -249,7 +249,7 @@ class GraphClient:
         Returns:
             UserProfile with id and user_principal_name, or None on failure
         """
-        url = f"{GRAPH_BASE_URL}/me?$select=id,userPrincipalName,mail"
+        url = f"{GRAPH_BASE_URL}/me"
         response_text = await self._web_api_get(url, access_token)
         if not response_text:
             return None
@@ -258,7 +258,6 @@ class GraphClient:
             return UserProfile(
                 id=data.get("id", ""),
                 user_principal_name=data.get("userPrincipalName", ""),
-                mail=data.get("mail", ""),
             )
         except Exception as exc:
             logger.error("Error parsing user profile: %s", exc)
@@ -856,80 +855,6 @@ class GraphClient:
             len(all_messages), mailbox_upn, folder_id,
         )
         return all_messages
-
-    async def get_mailbox_smtp_address(
-        self,
-        access_token: str,
-        mailbox_upn: str,
-    ) -> Dict:
-        """
-        Fetch the real primary SMTP address and all proxy addresses for a mailbox.
-
-        Useful when GRAPH_MAILBOX_UPN is an internal AD UPN (e.g. user@AD.company.com)
-        and you need to know the externally routable SMTP address to give to senders.
-
-        Calls: GET /users/{mailbox_upn}?$select=mail,proxyAddresses,userPrincipalName
-
-        Requires 'User.Read.All' Application permission (in addition to Mail.Read).
-
-        Returns a dict:
-            {
-                "primary_smtp":    str | None,   # e.g. "Shepherd@3plsystems.com"
-                "proxy_addresses": [str],         # all addresses, prefixed smtp:/SMTP:
-                "upn":             str | None,
-                "needs_permission": bool,         # True when 403 — User.Read.All missing
-            }
-        """
-        url = (
-            f"{GRAPH_BASE_URL}/users/{mailbox_upn}"
-            f"?$select=mail,proxyAddresses,userPrincipalName"
-        )
-        _empty = {"primary_smtp": None, "proxy_addresses": [], "upn": None, "needs_permission": False}
-
-        try:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, headers=headers)
-
-            if response.status_code == 403:
-                logger.warning(
-                    "Cannot read user directory for %s — "
-                    "User.Read.All Application permission is required in Azure AD "
-                    "(Azure App Registration → API Permissions → Microsoft Graph → "
-                    "Application → User.Read.All → Grant admin consent).",
-                    mailbox_upn,
-                )
-                return {**_empty, "needs_permission": True}
-
-            if response.status_code != 200:
-                logger.warning(
-                    "get_mailbox_smtp_address: unexpected status %s for %s",
-                    response.status_code, mailbox_upn,
-                )
-                return _empty
-
-            data = json.loads(response.text)
-            primary_smtp = data.get("mail")
-            proxy_addresses = data.get("proxyAddresses", [])
-            upn = data.get("userPrincipalName")
-
-            if primary_smtp:
-                logger.info("Mailbox %s → primary SMTP: %s", mailbox_upn, primary_smtp)
-            else:
-                logger.warning(
-                    "Mailbox %s has no 'mail' field — proxyAddresses: %s",
-                    mailbox_upn, proxy_addresses,
-                )
-
-            return {
-                "primary_smtp": primary_smtp,
-                "proxy_addresses": proxy_addresses,
-                "upn": upn,
-                "needs_permission": False,
-            }
-        except Exception as exc:
-            logger.error("Error fetching mailbox info for %s: %s", mailbox_upn, exc)
-            return _empty
 
     async def download_user_attachments(
         self,
