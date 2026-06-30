@@ -2,6 +2,7 @@
 Streamlit UI for Shepherd AI POC - Email Shipment Extraction
 """
 import streamlit as st
+import streamlit.components.v1 as st_components
 import tempfile
 import json
 import logging
@@ -283,7 +284,6 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                             index=idx,
                             customer_id=resolve_customer_id(email_data.get('from', '')),
                         )
-                    st.success(f"Extracted shipment data from {attachment['filename']}")
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -562,7 +562,6 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                             index=idx,
                             customer_id=resolved_customer_id,
                         )
-                    st.success(f"Extracted shipment data from {attachment['filename']}")
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -677,8 +676,7 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
             openai_agent = OpenAIAgent()
 
         st.session_state.graph_email_data = email_data
-        st.success(f"Email loaded: {email_data.get('subject', '(No subject)')}")
-        st.info(f"Found {len(email_data.get('attachments', []))} attachments")
+        st.info(f"Found {len(email_data.get('attachments', []))} attachment(s)")
 
         # Resolve customer ID
         with st.spinner("Resolving customer ID..."):
@@ -814,7 +812,6 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                             index=idx,
                             customer_id=resolved_customer_id,
                         )
-                    st.success(f"Extracted shipment data from {attachment['filename']}")
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -1039,7 +1036,6 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                         st.session_state.graph_email_processed = True
                         # Sync to shared shipments so display_shipment/missing-fields works correctly
                         st.session_state.shipments = shipments_data
-                        st.success(f"Successfully processed {len(shipments_data)} shipment(s)!")
                     else:
                         st.error("No shipments were extracted from this email.")
 
@@ -1047,67 +1043,138 @@ GRAPH_REDIRECT_URI=http://localhost:8501
     if st.session_state.graph_email_processed and st.session_state.graph_shipments:
         st.divider()
 
-        if st.session_state.raw_cu_results:
-            raw_cu_json = json.dumps(st.session_state.raw_cu_results, indent=2)
-            with st.expander("View Raw JSON"):
-                st.code(raw_cu_json, language="json")
-            st.download_button(
-                label="Download Raw JSON",
-                data=raw_cu_json,
-                file_name="raw_content_understanding.json",
-                mime="application/json",
-                type="secondary",
-                key="graph_dl_raw_json",
-            )
-
-        if st.session_state.graph_email_data:
-            with st.expander("Email Preview"):
-                _display_email_preview(st.session_state.graph_email_data)
-
-        if st.session_state.source_breakdown:
-            breakdown_json = json.dumps(st.session_state.source_breakdown, indent=2)
-            with st.expander("Normalized JSON"):
-                st.code(breakdown_json, language="json")
-            st.download_button(
-                label="Download Normalized JSON",
-                data=breakdown_json,
-                file_name="normalized_json.json",
-                mime="application/json",
-                type="secondary",
-                key="graph_dl_norm_json",
-            )
-
-        st.divider()
-        st.header("Extracted Shipments")
-
         shipments_list = st.session_state.graph_shipments
-        st.info(f"Found {len(shipments_list)} shipment(s)")
 
-        if len(shipments_list) == 1:
-            shipment_data = shipments_list[0]
-            display_shipment(
-                shipment_data["shipment"],
-                shipment_data["attachment_name"],
-                1,
-                shipment_idx=0,
-                customer_id=_get_customer_id(shipment_data),
-            )
-        else:
-            result_tabs = st.tabs([
-                f"Shipment {idx}: {data['attachment_name']}"
-                for idx, data in enumerate(shipments_list, 1)
-            ])
-            for result_tab, (idx, shipment_data) in zip(result_tabs, enumerate(shipments_list)):
-                with result_tab:
-                    display_shipment(
-                        shipment_data["shipment"],
-                        shipment_data["attachment_name"],
-                        shipment_data["attachment_index"],
-                        shipment_idx=idx,
-                        customer_id=_get_customer_id(shipment_data),
+        # ── Email summary banner ──────────────────────────────────────────────
+        if st.session_state.graph_email_data:
+            ed = st.session_state.graph_email_data
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 2, 2])
+                c1.markdown(f"**Subject:** {ed.get('subject', '—')}")
+                c2.markdown(f"**From:** {ed.get('from', '—')}")
+                c3.markdown(f"**Date:** {ed.get('date', '—')[:10] if ed.get('date') else '—'}")
+
+        # ── Shipment cards ────────────────────────────────────────────────────
+        st.subheader(f"Extracted Shipments  ({len(shipments_list)})")
+
+        def _render_shipment_card(shipment_data: dict, shipment_idx: int):
+            s: Shipment = shipment_data["shipment"]
+            rf = s.required_fields
+            nth = s.nice_to_have_fields
+
+            _render_email_type_badge(s.email_type)
+            if s.email_type == "spam":
+                st.error("Classified as spam — no shipment data extracted.")
+                return
+
+            if s.email_type == "shipment_tender" and _has_blocking_missing_fields(s):
+                _display_missing_fields_form(shipment_idx)
+                st.divider()
+
+            # ── Row 1: Pickup | Delivery ──────────────────────────────────
+            col_pick, col_del = st.columns(2)
+
+            with col_pick:
+                with st.container(border=True):
+                    st.markdown("**Pickup**")
+                    if rf.pickup_location:
+                        st.markdown(f"**{rf.pickup_location.name or '—'}**")
+                        if rf.pickup_location.address:
+                            a = rf.pickup_location.address
+                            parts = [p for p in [a.street, a.city, a.state, a.zip_code] if p]
+                            st.caption(", ".join(parts) if parts else "—")
+                    st.markdown(f"**Date:** {rf.pickup_date.strftime('%b %d, %Y') if rf.pickup_date else '—'}")
+                    if rf.pickup_window:
+                        st.markdown(f"**Window:** {rf.pickup_window}")
+                    if nth.pickup_contact:
+                        pc = nth.pickup_contact
+                        contact_parts = [p for p in [pc.name, pc.phone, pc.email] if p]
+                        if contact_parts:
+                            st.caption("Contact: " + " · ".join(contact_parts))
+
+            with col_del:
+                with st.container(border=True):
+                    st.markdown("**Delivery**")
+                    if rf.drop_location:
+                        st.markdown(f"**{rf.drop_location.name or '—'}**")
+                        if rf.drop_location.address:
+                            a = rf.drop_location.address
+                            parts = [p for p in [a.street, a.city, a.state, a.zip_code] if p]
+                            st.caption(", ".join(parts) if parts else "—")
+                    st.markdown(f"**Date:** {rf.delivery_date.strftime('%b %d, %Y') if rf.delivery_date else '—'}")
+                    if nth.drop_contact:
+                        dc = nth.drop_contact
+                        contact_parts = [p for p in [dc.name, dc.phone, dc.email] if p]
+                        if contact_parts:
+                            st.caption("Contact: " + " · ".join(contact_parts))
+
+            # ── Row 2: Equipment | Weight | Customer | Confidence ─────────
+            col_eq, col_wt, col_cu, col_conf = st.columns(4)
+            col_eq.metric("Equipment", rf.equipment_mode or "—")
+            col_wt.metric("Total Weight", f"{rf.total_weight:,.0f} lbs" if rf.total_weight else "—")
+            col_cu.metric("Customer", rf.customer_name or "—")
+            conf = nth.extraction_confidence
+            col_conf.metric("Confidence", f"{conf:.0%}" if conf else "—")
+
+            # ── Row 3: Items ──────────────────────────────────────────────
+            if rf.items:
+                with st.expander(f"Freight Items ({len(rf.items)})"):
+                    for item in rf.items:
+                        parts = []
+                        if item.quantity and item.unit:
+                            parts.append(f"{item.quantity} {item.unit}")
+                        elif item.quantity:
+                            parts.append(str(item.quantity))
+                        if item.description:
+                            parts.append(item.description)
+                        if item.weight:
+                            parts.append(f"{item.weight} lbs")
+                        if item.pieces:
+                            parts.append(f"{item.pieces} pcs")
+                        if item.pallets:
+                            parts.append(f"{item.pallets} pallets")
+                        st.markdown("- " + " · ".join(parts) if parts else "- (no detail)")
+
+            # ── Row 4: Nice-to-haves ──────────────────────────────────────
+            extras = []
+            if nth.reference_numbers:
+                extras.append(("Ref #s", ", ".join(nth.reference_numbers)))
+            if nth.order_number:
+                extras.append(("Order #", nth.order_number))
+            if nth.purchase_order:
+                extras.append(("PO #", nth.purchase_order))
+            if nth.special_instructions:
+                extras.append(("Special Instructions", nth.special_instructions))
+            if nth.temperature_requirements:
+                extras.append(("Temp Requirements", nth.temperature_requirements))
+            if rf.accessorials:
+                extras.append(("Accessorials", ", ".join(rf.accessorials)))
+
+            if extras:
+                with st.expander("Additional Details"):
+                    for label, val in extras:
+                        st.markdown(f"**{label}:** {val}")
+
+            # ── JSON output ───────────────────────────────────────────────
+            if not (s.email_type == "shipment_tender" and _has_blocking_missing_fields(s)):
+                with st.expander("View Output JSON"):
+                    st.code(
+                        format_client_json_str(s, customer_id=_get_customer_id(shipment_data)),
+                        language="json",
                     )
 
-        # Download ZIP of complete shipments
+        if len(shipments_list) == 1:
+            _render_shipment_card(shipments_list[0], 0)
+        else:
+            tabs = st.tabs([
+                f"Shipment {i+1}: {sd['attachment_name']}"
+                for i, sd in enumerate(shipments_list)
+            ])
+            for tab, (i, sd) in zip(tabs, enumerate(shipments_list)):
+                with tab:
+                    _render_shipment_card(sd, i)
+
+        # ── Download ──────────────────────────────────────────────────────────
         downloadable = [
             s for s in shipments_list
             if s["shipment"].email_type != "spam"
@@ -1118,39 +1185,66 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             import io
 
             st.divider()
-            col1, _ = st.columns([1, 1])
-            with col1:
+            col_dl, _ = st.columns([1, 2])
+            with col_dl:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                     body_shipments = [s for s in downloadable if s.get('is_body_shipment')]
                     non_body_shipments = [s for s in downloadable if not s.get('is_body_shipment')]
-
                     for idx, sd in enumerate(non_body_shipments, 1):
                         json_content = format_client_json_str(sd["shipment"], customer_id=_get_customer_id(sd))
-                        filename = f"shipment_{idx}_{Path(sd['attachment_name']).stem}.json"
-                        zf.writestr(filename, json_content)
-
+                        zf.writestr(f"shipment_{idx}_{Path(sd['attachment_name']).stem}.json", json_content)
                     if len(body_shipments) == 1:
-                        zf.writestr(
-                            "shipment_email_body.json",
-                            format_client_json_str(body_shipments[0]["shipment"], customer_id=_get_customer_id(body_shipments[0])),
-                        )
+                        zf.writestr("shipment_email_body.json",
+                            format_client_json_str(body_shipments[0]["shipment"], customer_id=_get_customer_id(body_shipments[0])))
                     elif len(body_shipments) > 1:
                         combined = {
                             f"shipment_{i+1}": json.loads(format_client_json_str(s["shipment"], customer_id=_get_customer_id(s)))
                             for i, s in enumerate(body_shipments)
                         }
                         zf.writestr("shipment_email_body.json", json.dumps(combined, indent=2))
-
                 st.download_button(
                     label="Download All Shipments (ZIP)",
                     data=zip_buffer.getvalue(),
                     file_name="all_shipments.zip",
                     mime="application/zip",
-                    type="secondary",
+                    type="primary",
                     use_container_width=True,
                     key="graph_dl_all_zip",
                 )
+
+        # ── Technical details (collapsed) ─────────────────────────────────────
+        with st.expander("Technical Details"):
+            tech_tab_labels = []
+            if st.session_state.graph_email_data:
+                tech_tab_labels.append("Email Preview")
+            if st.session_state.raw_cu_results:
+                tech_tab_labels.append("Raw OCR JSON")
+            if st.session_state.source_breakdown:
+                tech_tab_labels.append("Normalized JSON")
+
+            if tech_tab_labels:
+                tech_tabs = st.tabs(tech_tab_labels)
+                tab_idx = 0
+                if st.session_state.graph_email_data:
+                    with tech_tabs[tab_idx]:
+                        _display_email_preview(st.session_state.graph_email_data)
+                    tab_idx += 1
+                if st.session_state.raw_cu_results:
+                    with tech_tabs[tab_idx]:
+                        raw_cu_json = json.dumps(st.session_state.raw_cu_results, indent=2)
+                        _render_scrollable_json(raw_cu_json)
+                        st.download_button("Download Raw JSON", raw_cu_json,
+                            "raw_content_understanding.json", "application/json",
+                            key="graph_dl_raw_json")
+                    tab_idx += 1
+                if st.session_state.source_breakdown:
+                    with tech_tabs[tab_idx]:
+                        breakdown_json = json.dumps(st.session_state.source_breakdown, indent=2)
+                        _render_scrollable_json(breakdown_json)
+                        st.download_button("Download Normalized JSON", breakdown_json,
+                            "normalized_json.json", "application/json",
+                            key="graph_dl_norm_json")
 
 
 def main():
@@ -1374,6 +1468,29 @@ def _format_file_size(size_bytes: int) -> str:
     elif size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _render_scrollable_json(json_str: str, height: int = 400) -> None:
+    """Render a JSON string in an iframe with always-visible scrollbars (both axes)."""
+    safe = json_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    pre_height = height - 4
+    html = (
+        "<style>"
+        "body{margin:0;padding:0;background:#f8f9fa;}"
+        f"pre{{margin:0;padding:12px;height:{pre_height}px;overflow:scroll;"
+        "background:#f8f9fa;color:#1a1a1a;"
+        "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size: 14px;"
+        "white-space:pre;box-sizing:border-box;"
+        "border:1px solid #d0d0d0;border-radius:6px;}"
+        "pre::-webkit-scrollbar{width:12px;height:12px;}"
+        "pre::-webkit-scrollbar-track{background:#e8e8e8;border-radius:4px;}"
+        "pre::-webkit-scrollbar-thumb{background:#888;border-radius:4px;}"
+        "pre::-webkit-scrollbar-thumb:hover{background:#555;}"
+        "pre::-webkit-scrollbar-corner{background:#e8e8e8;}"
+        "</style>"
+        f"<pre>{safe}</pre>"
+    )
+    st_components.html(html, height=height, scrolling=False)
 
 
 def _display_email_preview(email_data: dict):
