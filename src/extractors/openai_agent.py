@@ -52,7 +52,6 @@ class OpenAIAgent:
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
             )
             content = response.choices[0].message.content
             return json.loads(content) if content else {}
@@ -84,7 +83,6 @@ class OpenAIAgent:
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
             )
 
             content = response.choices[0].message.content
@@ -192,7 +190,6 @@ Return only valid JSON."""
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
             )
             content = response.choices[0].message.content
             if not content:
@@ -244,7 +241,6 @@ Return only valid JSON. Omit fields that are not present in the text."""
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
             )
             content = response.choices[0].message.content
             return json.loads(content) if content else {}
@@ -292,7 +288,6 @@ Return JSON only:
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0,
             )
             content = response.choices[0].message.content
             if not content:
