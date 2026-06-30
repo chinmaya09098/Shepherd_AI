@@ -954,34 +954,26 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             st.session_state.graph_email_data = None
             st.rerun()
 
-    # Load inbox
-    col_load, _ = st.columns([1, 4])
-    with col_load:
-        load_inbox = st.button(
-            "Load Inbox", type="primary", key="graph_load_inbox", use_container_width=True
-        )
-
-    if load_inbox:
-        with st.spinner("Loading inbox emails..."):
-            try:
-                updated_token, messages = run_async(
-                    client.read_inbox(st.session_state.graph_token)
-                )
-                st.session_state.graph_token = updated_token
-                st.session_state.graph_messages = messages
-                if messages:
-                    st.success(f"Loaded {len(messages)} email(s) from inbox")
-                else:
-                    st.info("Inbox is empty or no new messages found.")
-            except Exception as e:
-                st.error(f"Failed to load inbox: {e}")
-                logger.error(f"Graph inbox load error: {e}", exc_info=True)
+    # Auto-load inbox on every render — no button needed
+    with st.spinner("Loading inbox..."):
+        try:
+            updated_token, messages = run_async(
+                client.read_inbox(st.session_state.graph_token)
+            )
+            st.session_state.graph_token = updated_token
+            st.session_state.graph_messages = messages
+        except Exception as e:
+            st.error(f"Failed to load inbox: {e}")
+            logger.error(f"Graph inbox load error: {e}", exc_info=True)
 
     # ── Email list and processing ─────────────────────────────────────────────
     if st.session_state.graph_messages:
         messages: List[MailMessage] = st.session_state.graph_messages
 
-        def _fmt_msg(msg: MailMessage) -> str:
+        st.success(f"Loaded {len(messages)} email(s) from inbox")
+
+        def _fmt_msg(idx: int) -> str:
+            msg = messages[idx]
             from_str = ""
             if msg.from_ and msg.from_.email_address:
                 ea = msg.from_.email_address
