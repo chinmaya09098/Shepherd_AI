@@ -35,6 +35,9 @@ from src.readers.graph_email_reader import GraphEmailReader
 from src.services.followup_orchestrator import FollowupOrchestrator, FollowupResult
 from src.services.conversation_tracker import CorrelationResult
 from src.extractors.reply_merger import ReplyMerger
+from src.services.hitl_router import HITLRouter
+from src.services.review_queue import ReviewQueue
+from src.models.review_request import ReviewRequest, REVIEW_STATUS_PENDING
 
 # Configure Streamlit page
 st.set_page_config(
@@ -89,6 +92,11 @@ if 'graph_is_tracked_reply' not in st.session_state:
 # Thread-aware conversation management state
 if 'graph_correlation_result' not in st.session_state:
     st.session_state.graph_correlation_result = None    # CorrelationResult for selected email
+# HITL review queue state
+if 'review_routed' not in st.session_state:
+    st.session_state.review_routed = {}                 # {shipment_idx: review_id}
+if 'show_review_queue' not in st.session_state:
+    st.session_state.show_review_queue = False          # True to show review panel
 
 
 def _get_blob_service_client() -> Optional[BlobServiceClient]:
@@ -1080,6 +1088,18 @@ def _render_active_conversations_panel():
 
     with st.sidebar:
         st.markdown("---")
+        # Review queue badge
+        try:
+            _rq_sidebar = ReviewQueue()
+            _rq_count   = len(_rq_sidebar.get_pending())
+            if _rq_count:
+                st.error(f"🔴 Review Queue: **{_rq_count}** pending")
+                if st.button("View Review Queue", key="sidebar_open_rq", use_container_width=True):
+                    st.session_state.show_review_queue = True
+                    st.rerun()
+        except Exception:
+            pass
+
         st.markdown(f"**Open Conversations ({len(active)})**")
         for state in active:
             icon, _ = _STATUS_COLORS.get(state.status, ("⚪", ""))
@@ -1214,20 +1234,7 @@ GRAPH_REDIRECT_URI=http://localhost:8501
         all_messages: List[MailMessage] = st.session_state.graph_messages
 
         # ── Shipment email filter ─────────────────────────────────────────────
-        show_all = st.toggle("Show all emails", value=False, key="graph_show_all_emails")
-        messages = all_messages if show_all else _filter_shipment_emails(all_messages)
-
-        if show_all:
-            st.info(f"Showing all {len(messages)} email(s) from inbox")
-        else:
-            hidden = len(all_messages) - len(messages)
-            msg = f"Showing {len(messages)} shipment-related email(s)"
-            if hidden:
-                msg += f" ({hidden} non-shipment email(s) hidden)"
-            if messages:
-                st.success(msg)
-            else:
-                st.warning(f"{msg} — toggle 'Show all emails' to see everything")
+        messages = _filter_shipment_emails(all_messages)
 
         if not messages:
             return
@@ -1571,6 +1578,182 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                             key="graph_dl_norm_json")
 
 
+def _render_review_queue_panel():
+    """
+    Full-page review queue panel.
+
+    Shows all pending ReviewRequests with editable missing-field forms
+    and Approve / Reject actions. Approved shipments update the
+    ConversationState to 'complete'.
+    """
+    queue    = ReviewQueue()
+    pending  = queue.get_pending()
+
+    st.markdown("## Review Queue")
+
+    if not pending:
+        st.success("No pending reviews — all shipments have been actioned.")
+        if st.button("Back to Inbox", key="review_back_empty"):
+            st.session_state.show_review_queue = False
+            st.rerun()
+        return
+
+    if st.button("Back to Inbox", key="review_back"):
+        st.session_state.show_review_queue = False
+        st.rerun()
+
+    st.markdown(f"**{len(pending)} pending review(s)**")
+    st.divider()
+
+    for req in pending:
+        with st.expander(
+            f"🔴 {req.reason_label}  ·  {req.subject[:60] or '(no subject)'}  ·  {req.created_at[:10]}",
+            expanded=True,
+        ):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**From:** {req.sender_name or ''} `{req.sender_email}`")
+                st.markdown(f"**Review ID:** `{req.review_id[:8]}…`")
+            with c2:
+                st.markdown(f"**Follow-ups sent:** {req.followup_count}")
+                if req.extraction_confidence is not None:
+                    st.markdown(f"**Extraction confidence:** {req.extraction_confidence:.0%}")
+
+            if req.flags:
+                for flag in req.flags:
+                    st.warning(flag)
+
+            st.markdown("---")
+
+            # ── Editable missing fields form ──────────────────────────────────
+            short_id = req.review_id[:8]
+            filled: dict = {}
+
+            if req.missing_fields:
+                st.markdown("**Fill missing fields:**")
+                for f_key in req.missing_fields:
+                    cfg = _REQUIRED_FIELD_CONFIG.get(f_key)
+                    if not cfg:
+                        filled[f_key] = st.text_input(f_key, key=f"rv_{short_id}_{f_key}")
+                        continue
+                    label = cfg["label"]
+                    ftype = cfg["type"]
+
+                    if ftype == "text":
+                        filled[f_key] = st.text_input(f"{label}:", key=f"rv_{short_id}_{f_key}")
+                    elif ftype == "date":
+                        val = st.date_input(f"{label}:", value=None, key=f"rv_{short_id}_{f_key}")
+                        filled[f_key] = val.isoformat() if val else None
+                    elif ftype == "address":
+                        st.markdown(f"**{label}:**")
+                        a1, a2 = st.columns(2)
+                        with a1:
+                            street = st.text_input("Street:", key=f"rv_{short_id}_{f_key}_street")
+                            city   = st.text_input("City:",   key=f"rv_{short_id}_{f_key}_city")
+                        with a2:
+                            state  = st.text_input("State:",  key=f"rv_{short_id}_{f_key}_state")
+                            zip_c  = st.text_input("Zip:",    key=f"rv_{short_id}_{f_key}_zip")
+                        filled[f_key] = {"street": street, "city": city, "state": state, "zip": zip_c}
+                    else:
+                        filled[f_key] = st.text_input(f"{label}:", key=f"rv_{short_id}_{f_key}")
+
+                st.markdown("---")
+            else:
+                st.info("No specific missing fields recorded — reviewer can approve as-is.")
+
+            # ── Extracted data reference ───────────────────────────────────────
+            with st.expander("View extracted shipment data (read-only)"):
+                import json as _json
+                st.code(_json.dumps(req.shipment_data, indent=2, default=str), language="json")
+
+            # ── Reviewer notes ────────────────────────────────────────────────
+            notes = st.text_area(
+                "Reviewer notes (optional):",
+                key=f"rv_notes_{short_id}",
+                height=60,
+            )
+
+            # ── Action buttons ────────────────────────────────────────────────
+            btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 2])
+
+            with btn_col1:
+                approve_clicked = st.button(
+                    "Approve & Complete",
+                    key=f"rv_approve_{short_id}",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            with btn_col3:
+                reject_clicked = st.button(
+                    "Reject",
+                    key=f"rv_reject_{short_id}",
+                    use_container_width=True,
+                )
+
+            # ── Handle approval ───────────────────────────────────────────────
+            if approve_clicked:
+                # Merge reviewer-supplied field values into the stored shipment dict
+                approved = dict(req.shipment_data)
+                rf = approved.get("requiredFields", {})
+                for f_key, val in filled.items():
+                    if not val:
+                        continue
+                    if f_key in ("pickupDate", "deliveryDate"):
+                        rf[f_key] = val
+                    elif f_key in ("pickupLocation", "dropLocation"):
+                        loc = rf.get(f_key) or {}
+                        addr = loc.get("address") or {}
+                        addr.update({
+                            "street":  val.get("street") or addr.get("street"),
+                            "city":    val.get("city")   or addr.get("city"),
+                            "state":   val.get("state")  or addr.get("state"),
+                            "zipCode": val.get("zip")    or addr.get("zipCode"),
+                        })
+                        loc["address"] = addr
+                        rf[f_key] = loc
+                    elif f_key == "customerName":
+                        rf["customerName"] = val
+                    elif f_key == "equipmentMode":
+                        rf["equipmentMode"] = val
+                    elif f_key == "totalWeight":
+                        try:
+                            rf["totalWeight"] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        rf[f_key] = val
+                approved["requiredFields"] = rf
+
+                queue.approve(req.review_id, approved, notes)
+
+                # Update the ConversationState to 'complete'
+                if req.conversation_id:
+                    try:
+                        from src.services.conversation_tracker import ConversationTracker
+                        from src.models.conversation_state import EVENT_CONVERSATION_COMPLETE
+                        tracker = ConversationTracker()
+                        state   = tracker.load(req.conversation_id)
+                        if state:
+                            state.status = "complete"
+                            state.add_event(
+                                EVENT_CONVERSATION_COMPLETE,
+                                {"source": "hitl_review", "review_id": req.review_id},
+                            )
+                            tracker.save(state)
+                    except Exception as exc:
+                        logger.warning("Could not update ConversationState after HITL approval: %s", exc)
+
+                st.success(f"Review {short_id}… approved. Shipment marked as complete.")
+                st.rerun()
+
+            # ── Handle rejection ──────────────────────────────────────────────
+            if reject_clicked:
+                queue.reject(req.review_id, notes)
+                st.error(f"Review {short_id}… rejected.")
+                st.rerun()
+
+
 def main():
     """Main Streamlit app"""
     
@@ -1627,6 +1810,30 @@ def main():
     """
     st.markdown(header_html, unsafe_allow_html=True)
     st.divider()
+
+    # ── Review Queue panel (full-page view when toggled) ───────────────────────
+    if st.session_state.get("show_review_queue"):
+        _render_review_queue_panel()
+        return
+
+    # ── Review Queue banner (shown when pending reviews exist) ─────────────────
+    try:
+        _rq     = ReviewQueue()
+        _pending = _rq.get_pending()
+        if _pending:
+            col_msg, col_btn = st.columns([6, 2])
+            with col_msg:
+                st.warning(
+                    f"**{len(_pending)} shipment(s) pending human review** — "
+                    "max follow-ups reached or send error."
+                )
+            with col_btn:
+                if st.button("Open Review Queue", key="open_rq_banner", type="primary", use_container_width=True):
+                    st.session_state.show_review_queue = True
+                    st.rerun()
+            st.divider()
+    except Exception:
+        pass
 
     # ── Live Mailbox ───────────────────────────────────────────────────────────
     _render_graph_tab()
@@ -1918,14 +2125,58 @@ def _display_missing_fields_form(shipment_idx: int):
         st.divider()
 
     elif followup_result and followup_result.action == "max_retries":
-        st.error(
-            f"Maximum follow-ups reached ({followup_result.followup_count}). "
-            "Manual review is required for this shipment."
-        )
+        already_routed = str(shipment_idx) in st.session_state.review_routed or shipment_idx in st.session_state.review_routed
+        if already_routed:
+            rid = st.session_state.review_routed.get(shipment_idx) or st.session_state.review_routed.get(str(shipment_idx), "")
+            st.warning(
+                f"Routed to Review Queue (ID: `{str(rid)[:8]}…`). "
+                "Open the **Review Queue** panel to action this shipment."
+            )
+        else:
+            st.error(
+                f"Maximum follow-ups reached ({followup_result.followup_count}). "
+                "This shipment requires human review."
+            )
+            current_message: Optional[MailMessage] = st.session_state.get("graph_current_message")
+            if current_message:
+                if st.button("Route to Review Queue", key=f"hitl_max_{shipment_idx}", type="primary"):
+                    router = HITLRouter()
+                    decision = router.evaluate(shipment=shipment, followup_result=followup_result)
+                    conv_id  = followup_result.conversation_id or (current_message.conversation_id or "")
+                    review   = router.route(
+                        shipment=shipment,
+                        message=current_message,
+                        decision=decision,
+                        conversation_id=conv_id,
+                        followup_count=followup_result.followup_count,
+                    )
+                    st.session_state.review_routed[shipment_idx] = review.review_id
+                    st.session_state.show_review_queue = True
+                    st.rerun()
         st.divider()
 
     elif followup_result and followup_result.action == "error":
-        st.error(f"Follow-up error: {followup_result.message}")
+        already_routed = str(shipment_idx) in st.session_state.review_routed or shipment_idx in st.session_state.review_routed
+        if already_routed:
+            rid = st.session_state.review_routed.get(shipment_idx) or st.session_state.review_routed.get(str(shipment_idx), "")
+            st.warning(f"Routed to Review Queue (ID: `{str(rid)[:8]}…`). Open the **Review Queue** panel to action this shipment.")
+        else:
+            st.error(f"Follow-up error: {followup_result.message}")
+            current_message_err: Optional[MailMessage] = st.session_state.get("graph_current_message")
+            if current_message_err and missing:
+                if st.button("Route to Review Queue", key=f"hitl_err_{shipment_idx}", type="primary"):
+                    router   = HITLRouter()
+                    decision = router.evaluate(shipment=shipment, followup_result=followup_result)
+                    conv_id  = current_message_err.conversation_id or ""
+                    review   = router.route(
+                        shipment=shipment,
+                        message=current_message_err,
+                        decision=decision,
+                        conversation_id=conv_id,
+                    )
+                    st.session_state.review_routed[shipment_idx] = review.review_id
+                    st.session_state.show_review_queue = True
+                    st.rerun()
         st.divider()
 
     # Show automated send button only when connected to a live mailbox

@@ -2,7 +2,7 @@
 Azure OpenAI agent for prompts and JSON structuring
 """
 import json
-from typing import Optional
+from typing import List, Optional
 from openai import AzureOpenAI
 from src.config import Config
 from src.models.shipment import Shipment
@@ -29,7 +29,12 @@ class OpenAIAgent:
             azure_endpoint=self.endpoint
         )
 
-    def extract_email_envelope(self, email_body: str, all_attachment_texts: Optional[str] = None) -> dict:
+    def extract_email_envelope(
+        self,
+        email_body: str,
+        all_attachment_texts: Optional[str] = None,
+        rag_context: Optional[List[str]] = None,
+    ) -> dict:
         """
         Pass 1 — Extract envelope-level context from the email body + all attachment texts.
 
@@ -37,9 +42,16 @@ class OpenAIAgent:
         ensures that pickup/drop location data found in one attachment (e.g. a BOL) is
         available as envelope context when processing sibling attachments (e.g. a picking list)
         that don't repeat that information.
+
+        Args:
+            email_body:           Plain-text body of the email.
+            all_attachment_texts: Concatenated text from all attachments.
+            rag_context:          Optional list of reference snippets retrieved from
+                                  Azure AI Search (``ShipmentContextClient.retrieve()``).
+                                  Injected into the prompt to ground the extraction.
         """
         logger.info("Pass 1: extracting email envelope context")
-        prompt = self._create_envelope_prompt(email_body, all_attachment_texts)
+        prompt = self._create_envelope_prompt(email_body, all_attachment_texts, rag_context)
 
         try:
             response = self.client.chat.completions.create(
@@ -60,18 +72,29 @@ class OpenAIAgent:
             logger.error(f"Error extracting email envelope: {e}")
             return {}
 
-    def extract_shipment_data(self, attachment_text: str, envelope: Optional[dict] = None) -> Optional[Shipment]:
+    def extract_shipment_data(
+        self,
+        attachment_text: str,
+        envelope: Optional[dict] = None,
+        rag_context: Optional[List[str]] = None,
+    ) -> Optional[Shipment]:
         """
         Pass 2 — Extract structured shipment data from a single attachment.
 
         The attachment is the primary source of truth. The envelope context
         (from Pass 1) is injected as a read-only reference — used only to fill
         fields that are completely absent from the attachment.
+
+        Args:
+            attachment_text: OCR / text content of one attachment.
+            envelope:        Envelope dict produced by ``extract_email_envelope()``.
+            rag_context:     Optional list of reference snippets from Azure AI Search.
+                             Injected to ground carrier names, location codes, etc.
         """
         logger.info("Pass 2: extracting shipment data from attachment")
 
         envelope_context = json.dumps(envelope, indent=2) if envelope else None
-        prompt = self._create_extraction_prompt(attachment_text, envelope_context)
+        prompt = self._create_extraction_prompt(attachment_text, envelope_context, rag_context)
 
         try:
             response = self.client.chat.completions.create(
@@ -319,7 +342,12 @@ Return JSON only:
 
         return shipment
 
-    def _create_envelope_prompt(self, email_body: str, all_attachment_texts: Optional[str] = None) -> str:
+    def _create_envelope_prompt(
+        self,
+        email_body: str,
+        all_attachment_texts: Optional[str] = None,
+        rag_context: Optional[List[str]] = None,
+    ) -> str:
         attachments_section = ""
         if all_attachment_texts:
             attachments_section = f"""
@@ -328,7 +356,16 @@ Attachments (all documents in this email — use to extract pickup/drop location
 {all_attachment_texts}
 ---
 """
+        rag_section = ""
+        if rag_context:
+            rag_lines = "\n".join(f"  - {s}" for s in rag_context)
+            rag_section = (
+                "\nREFERENCE CONTEXT (from HyperionTMS knowledge base — "
+                "use to validate or fill carrier names, facility addresses, "
+                "equipment codes):\n" + rag_lines + "\n"
+            )
         return f"""Extract envelope-level shipment context from this email and its attachments.
+{rag_section}
 
 Rules:
 - pickupName/Street/City/State/Zip: Look across the email body AND all attachments for the
@@ -421,7 +458,21 @@ Return JSON:
 
 Return only valid JSON."""
 
-    def _create_extraction_prompt(self, attachment_text: str, envelope_context: Optional[str] = None) -> str:
+    def _create_extraction_prompt(
+        self,
+        attachment_text: str,
+        envelope_context: Optional[str] = None,
+        rag_context: Optional[List[str]] = None,
+    ) -> str:
+        rag_section = ""
+        if rag_context:
+            rag_lines = "\n".join(f"  - {s}" for s in rag_context)
+            rag_section = (
+                "\nREFERENCE CONTEXT (from HyperionTMS knowledge base — "
+                "use to validate or fill carrier names, facility addresses, "
+                "equipment codes; never override values explicit in the document):\n"
+                + rag_lines + "\n"
+            )
         envelope_section = ""
         if envelope_context:
             envelope_section = f"""
@@ -444,8 +495,7 @@ absent from this specific attachment. Rules:
 ---
 """
         return f"""You are a logistics document understanding system. Extract structured shipment data from the attachment below.
-{envelope_section}
-
+{envelope_section}{rag_section}
 STEP 1 — CLASSIFY THE EMAIL
 Determine which single category best describes this email:
 - "shipment_tender": A confirmed load tender or booking request ready to create a new shipment

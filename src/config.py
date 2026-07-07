@@ -48,6 +48,25 @@ class Config:
     AZURE_AD_CLIENT_SECRET: Optional[str] = os.getenv("AZURE_AD_CLIENT_SECRET")
     GRAPH_REDIRECT_URI: str = os.getenv("GRAPH_REDIRECT_URI", "http://localhost:8501")
 
+    # Webhook / Function App settings
+    # GRAPH_MAILBOX_USER_ID: UPN or object ID of the mailbox to subscribe to
+    #   e.g. "inbox@company.com"  or the Azure AD object ID GUID
+    GRAPH_MAILBOX_USER_ID: Optional[str] = os.getenv("GRAPH_MAILBOX_USER_ID")
+    # GRAPH_WEBHOOK_NOTIFICATION_URL: public HTTPS URL of the Function App
+    #   HTTP trigger that receives Graph change notifications
+    #   e.g. "https://<funcapp>.azurewebsites.net/api/graph_webhook"
+    GRAPH_WEBHOOK_NOTIFICATION_URL: Optional[str] = os.getenv("GRAPH_WEBHOOK_NOTIFICATION_URL")
+    # GRAPH_WEBHOOK_CLIENT_STATE: secret echoed back in every notification for validation
+    GRAPH_WEBHOOK_CLIENT_STATE: str = os.getenv("GRAPH_WEBHOOK_CLIENT_STATE", "shepherd-ai-webhook")
+
+    # Azure Storage Queue used by Function App for async email processing
+    AZURE_STORAGE_QUEUE_NAME: str = os.getenv("AZURE_STORAGE_QUEUE_NAME", "email-notifications")
+
+    # Azure AI Search — separate index for RAG context retrieval
+    AZURE_SEARCH_CONTEXT_INDEX_NAME: str = os.getenv(
+        "AZURE_SEARCH_CONTEXT_INDEX_NAME", "shipment-context"
+    )
+
     # Other Configuration
     EMAIL_EXAMPLES_DIR: str = os.getenv("EMAIL_EXAMPLES_DIR", "Load_Tender_Email_Examples")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "output")

@@ -708,3 +708,61 @@ class GraphClient:
             ],
             flag=MailFlag(flag_status=flag_raw.get("flagStatus")) if flag_raw else None,
         )
+
+
+# ---------------------------------------------------------------------------
+# App-only authentication (client credentials flow)
+# Used by Azure Function Apps and WebhookSubscriptionManager, where no
+# interactive user session is available.
+# ---------------------------------------------------------------------------
+
+def get_app_token() -> str:
+    """
+    Acquire an application-only access token from Azure AD using the
+    OAuth 2.0 client credentials flow.
+
+    Suitable for server-to-server Graph API calls (Azure Functions, webhooks)
+    where there is no signed-in user.
+
+    Required environment variables:
+        AZURE_AD_TENANT_ID      — Azure AD tenant (directory) ID
+        AZURE_AD_CLIENT_ID      — Application (client) ID
+        AZURE_AD_CLIENT_SECRET  — Client secret value
+
+    Returns:
+        Access token string.
+
+    Raises:
+        RuntimeError: When any required credential is missing.
+        httpx.HTTPStatusError: When Azure AD returns a non-2xx response.
+    """
+    from src.config import Config
+
+    tenant_id     = Config.AZURE_AD_TENANT_ID
+    client_id     = Config.AZURE_AD_CLIENT_ID
+    client_secret = Config.AZURE_AD_CLIENT_SECRET
+
+    if not all([tenant_id, client_id, client_secret]):
+        raise RuntimeError(
+            "AZURE_AD_TENANT_ID, AZURE_AD_CLIENT_ID, and AZURE_AD_CLIENT_SECRET "
+            "must all be set for app-only (client credentials) authentication."
+        )
+
+    url  = f"{LOGIN_BASE_URL}/{tenant_id}/oauth2/v2.0/token"
+    data = {
+        "grant_type":    "client_credentials",
+        "client_id":     client_id,
+        "client_secret": client_secret,
+        "scope":         "https://graph.microsoft.com/.default",
+    }
+
+    with httpx.Client(timeout=30) as client:
+        response = client.post(url, data=data)
+        response.raise_for_status()
+        token = response.json().get("access_token", "")
+
+    if not token:
+        raise RuntimeError("Azure AD token response did not include access_token")
+
+    logger.debug("App-only token acquired for tenant %s", tenant_id)
+    return token
