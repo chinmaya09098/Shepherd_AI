@@ -5,8 +5,11 @@ import os
 from dotenv import load_dotenv
 from typing import Optional
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file.
+# override=True makes the project's .env the source of truth even when a
+# variable of the same name already exists in the OS environment (e.g. a stray
+# DATABASE_URL pointing at localhost).
+load_dotenv(override=True)
 
 
 class Config:
@@ -40,6 +43,17 @@ class Config:
 
     # Azure OpenAI Embedding
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT: Optional[str] = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+
+    # PostgreSQL (Azure Database for PostgreSQL)
+    # Provide either a full DATABASE_URL, or the individual POSTGRES_* parts.
+    # Example DATABASE_URL:
+    #   postgresql+psycopg2://user%40server:pwd@server.postgres.database.azure.com:5432/shepherd?sslmode=require
+    DATABASE_URL: Optional[str] = os.getenv("DATABASE_URL")
+    POSTGRES_HOST: Optional[str] = os.getenv("POSTGRES_HOST")
+    POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5432")
+    POSTGRES_DB: Optional[str] = os.getenv("POSTGRES_DB")
+    POSTGRES_USER: Optional[str] = os.getenv("POSTGRES_USER")
+    POSTGRES_PASSWORD: Optional[str] = os.getenv("POSTGRES_PASSWORD")
 
     # Microsoft Graph API / Azure AD OAuth
     # Used by GraphClient (converted from GraphTest appsettings.json AzureOutlookAPI section)

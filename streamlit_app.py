@@ -26,6 +26,7 @@ from src.models.shipment import Shipment, LocationInfo, ShipmentAddress
 from src.models.client_format import format_client_json_str
 from src.services.hyperion_client import resolve_customer_id
 from src.services.search_client import find_customer_matches
+from src.db.email_repository import record_email
 from src.utils.blob_log_handler import BlobLogHandler
 from src.utils.logger import get_logger
 from src.ui.styles import get_light_theme_css
@@ -471,6 +472,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                     st.success("Extracted shipment data from email body")
                 else:
                     st.warning("Could not extract shipment data from email body.")
+                _store_email_record(email_data, shipments, resolved_customer_id)            
                 Path(tmp_path).unlink(missing_ok=True)
                 return shipments
 
@@ -620,6 +622,9 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
 
         Path(tmp_path).unlink(missing_ok=True)
 
+        # Persist a single email record for this inbound email
+        _store_email_record(email_data, shipments, resolved_customer_id)
+
         # Upload captured logs to $logs/Processed_Logs/<eml_name>.log
         log_path = blob_log_handler.upload(blob_service, Config.AZURE_STORAGE_LOGS_CONTAINER, blob_name)
         if log_path:
@@ -639,6 +644,28 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
 
 def format_shipment_json(shipment: Shipment) -> str:
     return shipment.model_dump_json(by_alias=True, exclude_none=True, indent=2)
+
+
+def _store_email_record(email_data: dict, shipments: List[dict], customer_id: Optional[int]) -> None:
+    """
+    Persist one row in PostgreSQL for the inbound email just processed.
+
+    The 'Class' (SM/CM/AI) is derived from the per-attachment email types so
+    shipment-bearing mail is tagged 'SM' and everything else 'CM'. Failures are
+    swallowed inside record_email() — this never blocks extraction.
+    """
+    try:
+        llm_email_types = [s["shipment"].email_type for s in (shipments or [])]
+        record_email(
+            email_data,
+            direction="Inbound",
+            client_id=customer_id,
+            llm_email_types=llm_email_types,
+            extra_metadata={"shipment_count": len(shipments or [])},
+        )
+    except Exception as e:
+        logger.error(f"Failed to store email record: {e}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +893,9 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
+
+        # Persist a single email record for this inbound Graph email
+        _store_email_record(email_data, shipments, resolved_customer_id)
 
         return shipments
 
