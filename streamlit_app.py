@@ -32,6 +32,9 @@ from src.ui.styles import get_light_theme_css
 from src.services.graph_client import GraphClient
 from src.models.graph_models import GraphConfig, GraphToken, MailMessage
 from src.readers.graph_email_reader import GraphEmailReader
+from src.services.followup_orchestrator import FollowupOrchestrator, FollowupResult
+from src.services.conversation_tracker import CorrelationResult
+from src.extractors.reply_merger import ReplyMerger
 
 # Configure Streamlit page
 st.set_page_config(
@@ -76,6 +79,16 @@ if 'graph_email_processed' not in st.session_state:
     st.session_state.graph_email_processed = False
 if 'graph_email_data' not in st.session_state:
     st.session_state.graph_email_data = None
+# Follow-up email workflow state
+if 'graph_current_message' not in st.session_state:
+    st.session_state.graph_current_message = None       # MailMessage currently being processed
+if 'followup_results' not in st.session_state:
+    st.session_state.followup_results = {}              # {shipment_idx: FollowupResult}
+if 'graph_is_tracked_reply' not in st.session_state:
+    st.session_state.graph_is_tracked_reply = False     # True when selected email is a customer reply
+# Thread-aware conversation management state
+if 'graph_correlation_result' not in st.session_state:
+    st.session_state.graph_correlation_result = None    # CorrelationResult for selected email
 
 
 def _get_blob_service_client() -> Optional[BlobServiceClient]:
@@ -854,6 +867,232 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Shipment email domains / senders / subject keywords
+# ---------------------------------------------------------------------------
+
+# Sender domains that are never logistics emails
+_NON_SHIPMENT_DOMAINS = {
+    "microsoft.com", "linkedin.com", "facebook.com", "twitter.com",
+    "instagram.com", "youtube.com", "google.com", "amazon.com",
+    "apple.com", "github.com", "slack.com", "zoom.us", "dropbox.com",
+    "salesforce.com", "hubspot.com", "mailchimp.com", "constantcontact.com",
+    "sendgrid.net", "exacttarget.com", "marketo.com",
+}
+
+# Subject-line fragments that clearly indicate non-shipment email
+_NON_SHIPMENT_SUBJECT_KEYWORDS = [
+    "microsoft teams", "teams meeting", "calendar invite", "meeting invite",
+    "you're invited", "join the meeting",
+    "newsletter", "unsubscribe", "promotional", "special offer", "deal of",
+    "% off", "save now", "limited time",
+    "verify your email", "confirm your email", "reset your password",
+    "security alert", "sign in to", "your account",
+    "welcome to microsoft", "office 365", "azure portal",
+    "linkedin", "facebook", "twitter",
+    "invoice from", "receipt from",                # accounting, not freight
+]
+
+# Subject-line fragments that strongly indicate a shipment email
+_SHIPMENT_SUBJECT_KEYWORDS = [
+    "load", "shipment", "freight", "tender", "pickup", "delivery",
+    "bol ", "bill of lading", " ltl", " ftl", " tl ",
+    "truck", "carrier", "haul", "dispatch",
+    "rate", "quote", "ratecon", "rate con",
+    "cargo", "shipper", "consignee",
+    "tracking", "ship via",
+    "carrierpoint", "brokerware", "shipmind",
+    "booking", "booking confirmation",
+    "pu ", "p/u", "del ", "d/o",                  # shorthand used in freight
+    "fw:", "fwd:", "re:",                           # forwarded / replied freight threads
+]
+
+# Sender-email fragments that reliably indicate logistics
+_SHIPMENT_SENDER_FRAGMENTS = [
+    "carrierpoint", "brokerware", "shipmind", "ecogistics",
+    "freight", "logistics", "trucking", "carrier", "dispatch",
+    "shipping", "transport",
+]
+
+
+def _is_likely_shipment_email(msg: MailMessage) -> bool:
+    """
+    Return True if the email is likely shipment-related.
+
+    Uses a two-stage heuristic:
+      1. Hard-exclude known non-logistics senders and subject patterns.
+      2. Positively match shipment keywords in subject, body preview, or sender.
+    Defaults to True (show) if no signal is found, to avoid hiding edge-case
+    freight emails that don't contain standard keywords.
+    """
+    subject  = (msg.subject or "").lower()
+    preview  = (msg.body_preview or "").lower()
+    sender   = ""
+    sender_domain = ""
+    if msg.from_ and msg.from_.email_address:
+        sender = (msg.from_.email_address.address or "").lower()
+        sender_domain = sender.split("@")[-1] if "@" in sender else ""
+
+    # ── Stage 1: hard exclusions ─────────────────────────────────────────
+    if sender_domain in _NON_SHIPMENT_DOMAINS:
+        return False
+
+    # Generic no-reply / system senders (Microsoft notifications, etc.)
+    if any(s in sender for s in ("noreply@", "no-reply@", "donotreply@", "mailer-daemon@")):
+        return False
+
+    if any(kw in subject for kw in _NON_SHIPMENT_SUBJECT_KEYWORDS):
+        return False
+
+    # ── Stage 2: positive match ──────────────────────────────────────────
+    combined = subject + " " + preview
+    if any(kw in combined for kw in _SHIPMENT_SUBJECT_KEYWORDS):
+        return True
+
+    if any(frag in sender for frag in _SHIPMENT_SENDER_FRAGMENTS):
+        return True
+
+    # ── Default: show (conservative — don't hide ambiguous emails) ───────
+    return True
+
+
+def _filter_shipment_emails(messages: List[MailMessage]) -> List[MailMessage]:
+    """Filter a list of MailMessage objects to likely shipment-related emails only."""
+    return [m for m in messages if _is_likely_shipment_email(m)]
+
+
+_CORRELATION_METHOD_LABELS = {
+    "conversation_id": "Conversation Thread ID",
+    "reference_id":    "Reference / Order ID",
+    "subject":         "Subject-Line Similarity",
+    "sender+subject":  "Sender + Subject Match",
+    "sender":          "Sender Email Address",
+    "none":            "Not Matched",
+}
+
+_STATUS_COLORS = {
+    "processing":          ("🔵", "Processing"),
+    "awaiting_reply":      ("🟡", "Awaiting Reply"),
+    "complete":            ("🟢", "Complete"),
+    "max_retries_reached": ("🔴", "Max Retries — Manual Review"),
+    "failed":              ("🔴", "Failed"),
+}
+
+_EVENT_ICONS = {
+    "email_ingested":        "📨",
+    "email_classified":      "🏷️",
+    "extraction_complete":   "🔍",
+    "customer_id_resolved":  "👤",
+    "followup_generated":    "✍️",
+    "followup_sent":         "📤",
+    "reply_received":        "📩",
+    "reply_correlated":      "🔗",
+    "data_merged":           "🔀",
+    "validation_passed":     "✅",
+    "conversation_complete": "🏁",
+    "max_retries_reached":   "⛔",
+    "error":                 "❌",
+}
+
+
+def _render_conversation_timeline():
+    """
+    Render the conversation lifecycle timeline for the currently selected email.
+    Shows the full event log from ConversationState (inline) plus correlation info.
+    Only displayed when a tracked conversation is associated with the current email.
+    """
+    current_msg: Optional[MailMessage] = st.session_state.get("graph_current_message")
+    corr: Optional[CorrelationResult]  = st.session_state.get("graph_correlation_result")
+
+    if not current_msg:
+        return
+
+    # Try to load conversation state by conversation_id first, then via correlation
+    conv_state = None
+    try:
+        _orch = FollowupOrchestrator()
+        if current_msg.conversation_id:
+            conv_state = _orch.get_conversation_state(current_msg.conversation_id)
+        if conv_state is None and corr and corr.state:
+            conv_state = corr.state
+    except Exception:
+        pass
+
+    if not conv_state:
+        return
+
+    icon, status_label = _STATUS_COLORS.get(conv_state.status, ("⚪", conv_state.status))
+    with st.expander(f"Conversation History  {icon} {status_label}", expanded=False):
+        # Metadata row
+        meta_cols = st.columns([3, 2, 2, 2])
+        meta_cols[0].markdown(f"**Thread:** `{conv_state.conversation_id[:32]}…`")
+        meta_cols[1].markdown(f"**Follow-ups sent:** {conv_state.followup_count} / {conv_state.max_followups}")
+        meta_cols[2].markdown(f"**Status:** {status_label}")
+
+        # Correlation method (only when this is a reply)
+        if corr and corr.is_reply and corr.method != "none":
+            method_label = _CORRELATION_METHOD_LABELS.get(corr.method, corr.method)
+            meta_cols[3].markdown(f"**Matched via:** {method_label} ({corr.confidence:.0%})")
+
+        if conv_state.reference_ids:
+            st.caption(f"Reference IDs tracked: {', '.join(conv_state.reference_ids)}")
+
+        st.divider()
+
+        # Lifecycle events
+        events = conv_state.lifecycle_events
+        if events:
+            for ev in events:
+                ev_key    = ev.get("event", "")
+                ev_icon   = _EVENT_ICONS.get(ev_key, "•")
+                ev_label  = ev_key.replace("_", " ").title()
+                ts_raw    = ev.get("timestamp", "")
+                try:
+                    from datetime import datetime as _dt
+                    ts_fmt = _dt.fromisoformat(ts_raw).strftime("%b %d, %H:%M UTC")
+                except Exception:
+                    ts_fmt = ts_raw[:16]
+                details   = ev.get("details", {})
+                detail_md = "  ·  " + ",  ".join(
+                    f"`{k}`: {v}" for k, v in details.items() if v is not None and v != []
+                ) if details else ""
+                st.markdown(f"{ev_icon} **{ts_fmt}** — {ev_label}{detail_md}")
+        else:
+            st.caption("No lifecycle events recorded yet.")
+
+        if conv_state.missing_fields:
+            st.markdown(f"**Still missing:** {', '.join(f'`{f}`' for f in conv_state.missing_fields)}")
+
+
+def _render_active_conversations_panel():
+    """
+    Sidebar panel showing all conversations currently awaiting a customer reply.
+    Displayed in the graph tab so the user knows which threads are open.
+    """
+    try:
+        _orch  = FollowupOrchestrator()
+        active = _orch.list_active_conversations()
+    except Exception:
+        return
+
+    if not active:
+        return
+
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown(f"**Open Conversations ({len(active)})**")
+        for state in active:
+            icon, _ = _STATUS_COLORS.get(state.status, ("⚪", ""))
+            sent_at = (state.last_followup_at or state.created_at or "")[:10]
+            st.markdown(
+                f"{icon} **{state.sender_email}**  \n"
+                f"{state.subject[:50]}{'…' if len(state.subject) > 50 else ''}  \n"
+                f"Follow-up #{state.followup_count} · {sent_at}  \n"
+                f"Missing: {', '.join(f'`{f}`' for f in state.missing_fields)}"
+            )
+            st.markdown("")
+
+
 def _render_graph_tab():
     """Render the Live Mailbox (Microsoft Graph) tab content."""
 
@@ -949,7 +1188,14 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             st.session_state.graph_shipments = []
             st.session_state.graph_email_processed = False
             st.session_state.graph_email_data = None
+            st.session_state.graph_current_message = None
+            st.session_state.followup_results = {}
+            st.session_state.graph_is_tracked_reply = False
+            st.session_state.graph_correlation_result = None
             st.rerun()
+
+    # Sidebar: show open conversations awaiting reply
+    _render_active_conversations_panel()
 
     # Auto-load inbox on every render — no button needed
     with st.spinner("Loading inbox..."):
@@ -965,9 +1211,26 @@ GRAPH_REDIRECT_URI=http://localhost:8501
 
     # ── Email list and processing ─────────────────────────────────────────────
     if st.session_state.graph_messages:
-        messages: List[MailMessage] = st.session_state.graph_messages
+        all_messages: List[MailMessage] = st.session_state.graph_messages
 
-        st.success(f"Loaded {len(messages)} email(s) from inbox")
+        # ── Shipment email filter ─────────────────────────────────────────────
+        show_all = st.toggle("Show all emails", value=False, key="graph_show_all_emails")
+        messages = all_messages if show_all else _filter_shipment_emails(all_messages)
+
+        if show_all:
+            st.info(f"Showing all {len(messages)} email(s) from inbox")
+        else:
+            hidden = len(all_messages) - len(messages)
+            msg = f"Showing {len(messages)} shipment-related email(s)"
+            if hidden:
+                msg += f" ({hidden} non-shipment email(s) hidden)"
+            if messages:
+                st.success(msg)
+            else:
+                st.warning(f"{msg} — toggle 'Show all emails' to see everything")
+
+        if not messages:
+            return
 
         def _fmt_msg(idx: int) -> str:
             msg = messages[idx]
@@ -1009,8 +1272,25 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             st.session_state.source_breakdown = None
             st.session_state.raw_cu_results = None
             st.session_state.envelope = None
+            st.session_state.followup_results = {}
+            st.session_state.graph_current_message = None
+            st.session_state.graph_is_tracked_reply = False
+            st.session_state.graph_correlation_result = None
 
             selected_message = messages[selected_idx]
+
+            # Store the current MailMessage so the follow-up button can use it
+            st.session_state.graph_current_message = selected_message
+
+            # ── Thread-aware correlation (four fallback strategies) ────────
+            try:
+                _orchestrator = FollowupOrchestrator()
+                _correlation  = _orchestrator.correlate_message(selected_message)
+                st.session_state.graph_correlation_result = _correlation
+                st.session_state.graph_is_tracked_reply   = _correlation.is_reply
+            except Exception:
+                st.session_state.graph_correlation_result = None
+                st.session_state.graph_is_tracked_reply   = False
 
             with st.container():
                 with st.spinner("Downloading email and attachments from Graph API..."):
@@ -1026,10 +1306,53 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                         email_data = None
 
                 if email_data:
+                    # Show correlation banner when a reply is detected
+                    corr: Optional[CorrelationResult] = st.session_state.graph_correlation_result
+                    if st.session_state.graph_is_tracked_reply and corr:
+                        _method_labels = {
+                            "conversation_id": "same conversation thread",
+                            "reference_id":    "matching reference / order ID",
+                            "subject":         "subject-line similarity",
+                            "sender+subject":  "sender address + subject similarity",
+                            "sender":          "sender email address",
+                        }
+                        method_label = _method_labels.get(corr.method, corr.method)
+                        st.info(
+                            f"Tracked reply detected via **{method_label}** "
+                            f"(confidence {corr.confidence:.0%}). "
+                            "Reply data will be merged with the existing partial shipment."
+                        )
+
                     shipments_data = process_graph_email(
                         email_data=email_data,
                         message_id=selected_message.id or "",
                     )
+
+                    # If it's a reply, merge the extracted data with the tracked conversation state
+                    if st.session_state.graph_is_tracked_reply and shipments_data:
+                        try:
+                            _orchestrator = FollowupOrchestrator()
+                            reply_token = st.session_state.graph_token
+                            reply_client = _init_graph_client()
+                            if reply_client and reply_token:
+                                first_shipment = shipments_data[0]["shipment"]
+                                reply_result = run_async(
+                                    _orchestrator.handle_reply(
+                                        reply_message=selected_message,
+                                        reply_shipment=first_shipment,
+                                        graph_client=reply_client,
+                                        access_token=reply_token.access_token,
+                                        correlation=st.session_state.graph_correlation_result,
+                                    )
+                                )
+                                # Replace the extracted shipment with the merged version
+                                if reply_result.shipment:
+                                    shipments_data[0]["shipment"] = reply_result.shipment
+                                # Store the reply result so the UI can show the appropriate status
+                                st.session_state.followup_results[0] = reply_result
+                        except Exception as exc:
+                            logger.error("Reply merge failed: %s", exc, exc_info=True)
+                            st.warning(f"Reply merge encountered an error: {exc}")
 
                     if shipments_data:
                         st.session_state.graph_shipments = shipments_data
@@ -1053,6 +1376,9 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                 c1.markdown(f"**Subject:** {ed.get('subject', '—')}")
                 c2.markdown(f"**From:** {ed.get('from', '—')}")
                 c3.markdown(f"**Date:** {ed.get('date', '—')[:10] if ed.get('date') else '—'}")
+
+        # ── Conversation lifecycle timeline ───────────────────────────────────
+        _render_conversation_timeline()
 
         # ── Shipment cards ────────────────────────────────────────────────────
         st.subheader(f"Extracted Shipments  ({len(shipments_list)})")
@@ -1156,12 +1482,11 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                         st.markdown(f"**{label}:** {val}")
 
             # ── JSON output ───────────────────────────────────────────────
-            if not (s.email_type == "shipment_tender" and _has_blocking_missing_fields(s)):
-                with st.expander("View Output JSON"):
-                    st.code(
-                        format_client_json_str(s, customer_id=_get_customer_id(shipment_data)),
-                        language="json",
-                    )
+            with st.expander("View Output JSON"):
+                st.code(
+                    format_client_json_str(s, customer_id=_get_customer_id(shipment_data)),
+                    language="json",
+                )
 
         if len(shipments_list) == 1:
             _render_shipment_card(shipments_list[0], 0)
@@ -1576,7 +1901,92 @@ def _display_missing_fields_form(shipment_idx: int):
     shipment = st.session_state.shipments[shipment_idx]["shipment"]
     missing  = shipment.missing_required_fields
 
-    st.warning("⚠️ This shipment is missing required fields. A customer follow-up is required - please reply to the existing email thread and request the customer to respond with the missing details in the same thread.")
+    # ── Automated follow-up email section ─────────────────────────────────
+    followup_result: Optional[FollowupResult] = st.session_state.followup_results.get(shipment_idx)
+
+    if followup_result and followup_result.action == "followup_sent":
+        st.success(
+            f"Follow-up email #{followup_result.followup_count} sent successfully. "
+            "Waiting for customer reply. The conversation is being tracked automatically."
+        )
+        with st.expander("View sent email preview"):
+            st.markdown(followup_result.followup_html or "", unsafe_allow_html=True)
+        st.divider()
+
+    elif followup_result and followup_result.action == "complete":
+        st.success("All required fields are now present after the customer's reply. Shipment is ready for creation.")
+        st.divider()
+
+    elif followup_result and followup_result.action == "max_retries":
+        st.error(
+            f"Maximum follow-ups reached ({followup_result.followup_count}). "
+            "Manual review is required for this shipment."
+        )
+        st.divider()
+
+    elif followup_result and followup_result.action == "error":
+        st.error(f"Follow-up error: {followup_result.message}")
+        st.divider()
+
+    # Show automated send button only when connected to a live mailbox
+    graph_connected = st.session_state.get("graph_connected", False)
+    current_message: Optional[MailMessage] = st.session_state.get("graph_current_message")
+    graph_token = st.session_state.get("graph_token")
+
+    if graph_connected and current_message and graph_token:
+        already_sent = followup_result and followup_result.action in ("followup_sent", "complete")
+        if not already_sent:
+            blocking = [f for f in missing if f not in ("items",)]
+            if blocking:
+                col_btn, col_info = st.columns([2, 5])
+                with col_btn:
+                    send_clicked = st.button(
+                        "Send Follow-Up Email",
+                        key=f"send_followup_{shipment_idx}",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with col_info:
+                    st.caption(
+                        f"Will request {len(blocking)} missing field(s) from the customer "
+                        "as a reply in the same email thread."
+                    )
+
+                if send_clicked:
+                    client = _init_graph_client()
+                    if client:
+                        with st.spinner("Generating and sending follow-up email..."):
+                            try:
+                                orchestrator = FollowupOrchestrator()
+                                result = run_async(
+                                    orchestrator.handle_initial_extraction(
+                                        shipment=shipment,
+                                        message=current_message,
+                                        graph_client=client,
+                                        access_token=graph_token.access_token,
+                                    )
+                                )
+                                st.session_state.followup_results[shipment_idx] = result
+                            except Exception as exc:
+                                logger.error("Follow-up send failed: %s", exc, exc_info=True)
+                                st.session_state.followup_results[shipment_idx] = FollowupResult(
+                                    action="error",
+                                    message=str(exc),
+                                )
+                        st.rerun()
+        st.divider()
+    else:
+        st.warning(
+            "⚠️ This shipment is missing required fields. "
+            "Connect to a live mailbox (Live Mailbox tab) to enable automated follow-up emails, "
+            "or manually reply to the customer thread with the requested details."
+        )
+
+    # Hide the manual form while waiting for a customer reply — it becomes
+    # relevant again only if the automated follow-up failed or was never sent.
+    followup_pending = followup_result and followup_result.action in ("followup_sent", "complete")
+    if followup_pending:
+        return
 
     field_values = {}
 
@@ -1609,12 +2019,6 @@ def _display_missing_fields_form(shipment_idx: int):
             elif ftype == "date":
                 field_values[field] = st.date_input(f"{label}:", value=None, key=f"{field}_{shipment_idx}")
 
-            # elif ftype == "warning_only":
-            #     st.warning(
-            #         f"**{label} could not be extracted automatically.** "
-            #         "Please verify the source document contains item/commodity details and reprocess."
-            #     )
-
         submitted = st.form_submit_button("Submit Missing Fields", type="primary")
         if submitted:
             _apply_missing_fields(shipment_idx, field_values)
@@ -1637,11 +2041,9 @@ def display_shipment(shipment: Shipment, attachment_name: str, index: int, shipm
 
     rf = shipment.required_fields
 
-    # JSON view — only shown once all blocking required fields are present
-    if not (shipment.email_type == "shipment_tender" and _has_blocking_missing_fields(shipment)):
-        st.subheader("JSON Data")
-        with st.expander("View JSON"):
-            st.code(format_client_json_str(shipment, customer_id=customer_id), language="json")
+    st.subheader("JSON Data")
+    with st.expander("View JSON"):
+        st.code(format_client_json_str(shipment, customer_id=customer_id), language="json")
 
 
 if __name__ == "__main__":
