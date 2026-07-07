@@ -1110,11 +1110,11 @@ GRAPH_REDIRECT_URI=http://localhost:8501
 
             # ── Row 2: Equipment | Weight | Customer | Confidence ─────────
             col_eq, col_wt, col_cu, col_conf = st.columns(4)
-            col_eq.metric("Equipment", rf.equipment_mode or "—")
-            col_wt.metric("Total Weight", f"{rf.total_weight:,.0f} lbs" if rf.total_weight else "—")
-            col_cu.metric("Customer", rf.customer_name or "—")
+            col_eq.write(f"**Equipment**\n{rf.equipment_mode or '—'}")
+            col_wt.write(f"**Total Weight**\n{f'{rf.total_weight:,.0f} lbs' if rf.total_weight else '—'}")
+            col_cu.write(f"**Customer**\n{rf.customer_name or '—'}")
             conf = nth.extraction_confidence
-            col_conf.metric("Confidence", f"{conf:.0%}" if conf else "—")
+            col_conf.write(f"**Confidence**\n{f'{conf:.0%}' if conf else '—'}")
 
             # ── Row 3: Items ──────────────────────────────────────────────
             if rf.items:
@@ -1184,7 +1184,6 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             import zipfile
             import io
 
-            st.divider()
             col_dl, _ = st.columns([1, 2])
             with col_dl:
                 zip_buffer = io.BytesIO()
