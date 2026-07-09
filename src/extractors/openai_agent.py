@@ -501,12 +501,12 @@ Determine which single category best describes this email:
 - "shipment_tender": A confirmed load tender or booking request ready to create a new shipment
 - "shipment_quote": A quote request or rate inquiry — part of the shipment lifecycle but requires pricing before a shipment can be created
 - "tracking_request": A request for the status or location of an existing shipment
-- "status_update": A notification about an active shipment in progress — e.g. shipment assigned, carrier confirmation, pickup confirmed, in-transit update. CarrierPoint notification emails always fall here (see rule below).
+- "status_update": A notification about an active shipment in progress — e.g. pickup confirmed, in-transit update, delivery confirmation.
 - "spam": Irrelevant or non-operational content — includes traditional spam/phishing, newsletters, marketing emails, vendor promotions, and internal emails with no shipment intent
 - "other": Invoices, bid award notices (e.g. "Bid Award Notice", "Auction Load", "Carrier Action Required" from platforms like BestTransport, DAT, or similar), and anything that does not fit the categories above
 
-CarrierPoint rule: If the email is from notifications@carrierpoint.com, is forwarded from that address, or contains CarrierPoint branding ("CarrierPoint" logo or the phrase "you have been selected to carry on CarrierPoint"), classify it as "status_update".
-Bid award rule: Emails with subjects or bodies containing "Bid Award", "Auction Load", or "Carrier Action Required" from freight auction platforms are NOT status updates — classify them as "other".
+CarrierPoint rule: If the email is from notifications@carrierpoint.com, is forwarded from that address, or contains CarrierPoint branding ("CarrierPoint" logo or the phrase "you have been selected to carry on CarrierPoint") AND contains assigned shipment data (stops, weight, dates), classify it as "shipment_tender" so missing fields can be collected and a new shipment created.
+Bid award rule: Emails with subjects or bodies containing "Bid Award", "Auction Load", or "Carrier Action Required" from freight auction platforms are NOT shipment tenders — classify them as "other".
 
 STEP 2 — EXTRACT BASED ON TYPE
 
@@ -530,7 +530,15 @@ Nice-to-have fields (place in niceToHaveFields):
 
 [shipment_quote]
 Extract all available fields into requiredFields and niceToHaveFields (same structure as shipment_tender).
-Set missingRequiredFields to [] — do not flag missing fields for quote requests.
+After extraction, identify which required fields are still missing and list their keys in missingRequiredFields — same rules as shipment_tender. A rate cannot be provided without complete pickup and delivery information.
+
+Required fields (same as shipment_tender):
+- customerName: Company or person requesting the quote
+- pickupLocation: name + address — at minimum city + state, or a zip code
+- dropLocation: name + address — at minimum city + state, or a zip code
+- pickupDate OR pickupWindow: When the pickup should occur
+- equipmentMode: Transport type (e.g. Dry Van, Flatbed, Reefer, LTL, Customer Truck)
+- items: At least one commodity entry with a weight value
 
 [tracking_request]
 Extract whatever reference identifiers are present (shipment IDs, order numbers, dates).

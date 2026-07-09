@@ -39,6 +39,10 @@ from src.extractors.reply_merger import ReplyMerger
 from src.services.hitl_router import HITLRouter
 from src.services.review_queue import ReviewQueue
 from src.models.review_request import ReviewRequest, REVIEW_STATUS_PENDING
+from src.services.brokerware_client import (
+    create_shipment as brokerware_create_shipment,
+    is_configured as brokerware_is_configured,
+)
 
 # Configure Streamlit page
 st.set_page_config(
@@ -150,6 +154,30 @@ def _get_customer_id(shipment_data: dict) -> Optional[int]:
     return shipment_data.get("customer_id")
 
 
+def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None) -> None:
+    """
+    Submit a fully-extracted shipment to Brokerware TMS CreateShipmentAPI.
+    Shows success/error feedback in the Streamlit UI.
+    Only runs when Brokerware credentials are configured.
+    """
+    if not brokerware_is_configured():
+        return
+
+    if shipment.email_type not in ("shipment_tender", "shipment_quote"):
+        return
+
+    with st.spinner("Creating shipment in Brokerware TMS..."):
+        result = brokerware_create_shipment(shipment, customer_id=customer_id)
+
+    if result.success:
+        shipment_id = result.shipment_id or "N/A"
+        st.success(f"Shipment created in Brokerware TMS — ID: `{shipment_id}`")
+        logger.info(f"Brokerware shipment created: id={shipment_id}")
+    else:
+        st.error(f"Brokerware TMS — shipment creation failed: {result.error}")
+        logger.error(f"Brokerware create shipment failed: {result.error}")
+
+
 def _save_shipment_json_to_blob(shipment: Shipment, email_name: str, source_name: str, index: int, customer_id: Optional[int] = None) -> None:
     """
     Save a single shipment's JSON representation to the output Azure Blob container.
@@ -189,18 +217,28 @@ def _validate_zip_fields(shipment: Shipment) -> None:
     zip code specifically and adding 'shipperZip' / 'consigneeZip' to
     missingRequiredFields when needed.
 
-    Only runs when the parent location object exists — if the location
-    itself is absent it is already flagged at the location level.
+    Handles three cases:
+      1. location exists, address exists, but zip_code is null/empty
+      2. location exists, but address object itself is null (no address at all)
+      3. location is null — safety net in case LLM did not flag pickupLocation
     """
     rf = shipment.required_fields
 
-    if (rf.pickup_location and
-            not (rf.pickup_location.address and rf.pickup_location.address.zip_code)):
+    pickup_has_zip = (
+        rf.pickup_location
+        and rf.pickup_location.address
+        and rf.pickup_location.address.zip_code
+    )
+    if not pickup_has_zip:
         if "shipperZip" not in shipment.missing_required_fields:
             shipment.missing_required_fields.append("shipperZip")
 
-    if (rf.drop_location and
-            not (rf.drop_location.address and rf.drop_location.address.zip_code)):
+    drop_has_zip = (
+        rf.drop_location
+        and rf.drop_location.address
+        and rf.drop_location.address.zip_code
+    )
+    if not drop_has_zip:
         if "consigneeZip" not in shipment.missing_required_fields:
             shipment.missing_required_fields.append("consigneeZip")
 
@@ -299,13 +337,15 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                         'sender_email': email_data.get('from', ''),
                     })
                     if not shipment.missing_required_fields:
+                        cid = resolve_customer_id(email_data.get('from', ''))
                         _save_shipment_json_to_blob(
                             shipment,
                             email_name=uploaded_file.name,
                             source_name=attachment['filename'],
                             index=idx,
-                            customer_id=resolve_customer_id(email_data.get('from', '')),
+                            customer_id=cid,
                         )
+                        _submit_to_brokerware(shipment, customer_id=cid)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -331,13 +371,15 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                     'sender_email': email_data.get('from', ''),
                 })
                 if not shipment.missing_required_fields:
+                    cid = resolve_customer_id(email_data.get('from', ''))
                     _save_shipment_json_to_blob(
                         shipment,
                         email_name=uploaded_file.name,
                         source_name='Email Body',
                         index=1,
-                        customer_id=resolve_customer_id(email_data.get('from', '')),
+                        customer_id=cid,
                     )
+                    _submit_to_brokerware(shipment, customer_id=cid)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
@@ -469,6 +511,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                             index=1,
                             customer_id=resolved_customer_id,
                         )
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                     st.success("Extracted shipment data from email body")
                 else:
                     st.warning("Could not extract shipment data from email body.")
@@ -585,6 +628,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                             index=idx,
                             customer_id=resolved_customer_id,
                         )
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -616,6 +660,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                         index=1,
                         customer_id=resolved_customer_id,
                     )
+                    _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
@@ -860,6 +905,7 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                             index=idx,
                             customer_id=resolved_customer_id,
                         )
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -890,6 +936,7 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                         index=1,
                         customer_id=resolved_customer_id,
                     )
+                    _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")

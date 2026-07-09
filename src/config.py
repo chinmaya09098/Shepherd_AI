@@ -33,8 +33,14 @@ class Config:
     AZURE_STORAGE_LOGS_CONTAINER: str = os.getenv("AZURE_STORAGE_LOGS_CONTAINER", "processed-logs")
     
     # Hyperion TMS API
-    HYPERION_CLIENT_ID: str = os.getenv("HYPERION_CLIENT_ID", "eeb5772a6bef4827b3e4d2c6fea946b2")
-    HYPERION_CLIENT_SECRET: str = os.getenv("HYPERION_CLIENT_SECRET", "eMcLvyWAEMVqGjTU0F0e0Az9OKW3Ymr8ov0cdNSX8xs")
+    HYPERION_CLIENT_ID: Optional[str] = os.getenv("HYPERION_CLIENT_ID")
+    HYPERION_CLIENT_SECRET: Optional[str] = os.getenv("HYPERION_CLIENT_SECRET")
+
+    # Brokerware TMS API
+    BROKERWARE_BASE_URL: str = os.getenv("BROKERWARE_BASE_URL", "https://shepherd.brokerware.io")
+    BROKERWARE_CLIENT_ID: Optional[str] = os.getenv("BROKERWARE_CLIENT_ID")
+    BROKERWARE_CLIENT_SECRET: Optional[str] = os.getenv("BROKERWARE_CLIENT_SECRET")
+    BROKERWARE_DEFAULT_CUSTOMER_ID: int = int(os.getenv("BROKERWARE_DEFAULT_CUSTOMER_ID", "0"))
 
     # Azure AI Search
     AZURE_SEARCH_ENDPOINT: Optional[str] = os.getenv("AZURE_SEARCH_ENDPOINT")

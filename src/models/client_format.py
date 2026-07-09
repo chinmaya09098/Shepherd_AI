@@ -43,30 +43,31 @@ def _normalize_country(country: Optional[str], default: str = "US") -> str:
 # ---------------------------------------------------------------------------
 
 _EQUIPMENT_TYPE_MAP = {
-    "dry van":       ("ftl", "DryVan"),
-    "flatbed":       ("ftl", "Flatbed"),
-    "reefer":        ("ftl", "Reefer"),
-    "refrigerated":  ("ftl", "Reefer"),
-    "step deck":     ("ftl", "StepDeck"),
-    "stepdeck":      ("ftl", "StepDeck"),
-    "box truck":     ("ftl", "BoxTruck"),
-    "straight truck":("ftl", "StraightTruck"),
-    "customer truck":("ftl", "NotSpecified"),
-    "intermodal":    ("ftl", "NotSpecified"),
-    "ltl":           ("ltl", "NotSpecified"),
-    "parcel":        ("parcel", "NotSpecified"),
+    "dry van":       ("Truckload", "Van"),
+    "flatbed":       ("Truckload", "Flatbed"),
+    "fb":            ("Truckload", "Flatbed"),
+    "reefer":        ("Truckload", "Reefer"),
+    "refrigerated":  ("Truckload", "Reefer"),
+    "step deck":     ("Truckload", "StepDeck"),
+    "stepdeck":      ("Truckload", "StepDeck"),
+    "box truck":     ("Truckload", "NotSpecified"),
+    "straight truck":("Truckload", "NotSpecified"),
+    "customer truck":("Truckload", "NotSpecified"),
+    "intermodal":    ("Truckload", "NotSpecified"),
+    "ltl":           ("LTL", "NotSpecified"),
+    "parcel":        ("Parcel", "NotSpecified"),
 }
 
 
 def _map_equipment(equipment_mode: Optional[str]) -> Tuple[str, str]:
-    """Return (shipmentMode, equipmentType) from internal equipmentMode string."""
+    """Return (shipmentMode, equipmentType) using Brokerware-accepted values."""
     if not equipment_mode:
-        return "ftl", "NotSpecified"
+        return "Truckload", "NotSpecified"
     mode = equipment_mode.lower().strip()
     for key, value in _EQUIPMENT_TYPE_MAP.items():
         if key in mode:
             return value
-    return "ftl", "NotSpecified"
+    return "Truckload", "NotSpecified"
 
 
 # ---------------------------------------------------------------------------
@@ -167,20 +168,22 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
     items = []
     for item in rf.items:
         length, width, height = _parse_dimensions(item.dimensions)
-        items.append({
+        # Brokerware rejects null for decimal fields — only include them when available
+        item_dict: dict = {
             "productDescription": item.description,
-            "class":              None,   # not extracted from documents
-            "pieces":             int(item.pieces) if item.pieces is not None else None,
-            "weight":             item.weight,
-            "nmfc":               None,   # not extracted from documents
+            "class":              "100",  # default; Brokerware requires a non-null value
+            "pieces":             int(item.pieces) if item.pieces is not None else 1,
+            "weight":             item.weight if item.weight is not None else 0,
             "isHazardous":        False,
             "packaging":          "pallets" if (item.pallets or 0) > 0 else "truckloads",
-            "billed":             None,   # not extracted from documents
-            "cost":               None,   # not extracted from documents
-            "length":             length,
-            "width":              width,
-            "height":             height,
-        })
+        }
+        if length is not None:
+            item_dict["length"] = length
+        if width is not None:
+            item_dict["width"] = width
+        if height is not None:
+            item_dict["height"] = height
+        items.append(item_dict)
 
     # ── Carrier ──────────────────────────────────────────────────────────────
     carrier_val = ntf.carrier
@@ -205,8 +208,11 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
         # Items (at least one required)
         "items": items,
 
-        # Shipper details
-        "shipperAddress":  pickup_addr.street if pickup_addr else None,
+        # Shipper details — Brokerware requires shipperAddress; fall back to city+state
+        "shipperAddress":  (
+            pickup_addr.street if (pickup_addr and pickup_addr.street)
+            else (f"{pickup_addr.city}, {pickup_addr.state}" if pickup_addr and pickup_addr.city else None)
+        ),
         "shipperName":     (pickup.name if pickup and pickup.name else rf.customer_name),
         "shipperContact":  ntf.pickup_contact.name  if ntf.pickup_contact else None,
         "shipperEmail":    ntf.pickup_contact.email if ntf.pickup_contact else None,
@@ -223,8 +229,8 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
         "poReference":    ntf.purchase_order,
         "shipperNumber":  ntf.shipment_id or ntf.order_number,
 
-        # Palletisation — default "0"
-        "isPalletized": "1" if any_palletized else "0",
+        # Palletisation — boolean required by Brokerware API
+        "isPalletized": bool(any_palletized),
 
         # Special instructions → Bill of Lading note
         "billOfLandingNote": ntf.special_instructions,
