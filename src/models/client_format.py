@@ -24,6 +24,13 @@ _COUNTRY_NORMALIZE = {
 }
 
 
+def _normalize_zip(zip_code: Optional[str]) -> Optional[str]:
+    """Return only the 5-digit base zip, stripping ZIP+4 suffix (e.g. '47353-8810' → '47353')."""
+    if not zip_code:
+        return None
+    return zip_code.strip().split("-")[0][:5] or None
+
+
 def _normalize_country(country: Optional[str], default: str = "US") -> str:
     """Return ISO 3166-1 alpha-2 code. Falls back to default if unrecognised."""
     if not country:
@@ -196,9 +203,9 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
 
     return {
         # Required location fields
-        "shipperZip":      pickup_addr.zip_code if pickup_addr else None,
+        "shipperZip":      _normalize_zip(pickup_addr.zip_code if pickup_addr else None),
         "shipperCountry":  _normalize_country(pickup_addr.country if pickup_addr else None),
-        "consigneeZip":    drop_addr.zip_code if drop_addr else None,
+        "consigneeZip":    _normalize_zip(drop_addr.zip_code if drop_addr else None),
         "consigneeCountry":_normalize_country(drop_addr.country if drop_addr else None),
 
         # Equipment

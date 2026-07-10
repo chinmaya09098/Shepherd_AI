@@ -1302,6 +1302,17 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             )
             st.session_state.graph_token = updated_token
             st.session_state.graph_messages = messages
+
+            # ── Phase 1: immediately store every inbox email to PostgreSQL ────
+            # class_code is NULL (unprocessed) at this point.
+            # update_email_class() will patch it once the pipeline runs.
+            try:
+                from src.db.email_repository import upsert_inbox_email
+                for _m in (st.session_state.graph_messages or []):
+                    upsert_inbox_email(_m)
+            except Exception as _pe:
+                logger.warning("Inbox early-store to PostgreSQL failed (non-fatal): %s", _pe)
+
         except Exception as e:
             st.error(f"Failed to load inbox: {e}")
             logger.error(f"Graph inbox load error: {e}", exc_info=True)

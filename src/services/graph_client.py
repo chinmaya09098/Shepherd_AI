@@ -632,18 +632,19 @@ class GraphClient:
             async with httpx.AsyncClient() as client:
                 response = await client.get(url, headers=headers)
 
-            if response.status_code == 200:
-                return response.text
-
-            logger.error(
-                "Graph API %s returned %s: %s", url, response.status_code, response.text
-            )
-            raise Exception(
-                f"Graph API returned {response.status_code}: {response.text}"
-            )
         except Exception as exc:
-            logger.error("Error calling Graph API %s: %s", url, exc)
+            logger.error(
+                "Graph API network error for %s: %s (%s)", url, exc, type(exc).__name__
+            )
+            return ""
 
+        if response.status_code == 200:
+            return response.text
+
+        logger.error(
+            "Graph API %s returned HTTP %s — body: %s",
+            url, response.status_code, response.text[:500],
+        )
         return ""
 
     # -------------------------------------------------------------------------

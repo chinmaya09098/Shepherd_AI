@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, Integer, Text, DateTime, func
+from sqlalchemy import Boolean, String, Integer, Text, DateTime, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -19,22 +19,28 @@ class EmailRecord(Base):
     messages, and outbound Shepherd replies).
 
     Field notes:
-      - id              : UUID primary key (generated app-side).
-      - client_id       : the resolved Hyperion customerId for the email, as text
-                          (nullable — not every email resolves to a client).
-      - conversation_id : Graph/Outlook thread key that groups related messages.
-                          Empty for .eml files (no thread context).
-      - message_id      : unique per-message id (Graph message id, falls back to
-                          the RFC-2822 Internet-Message-Id).
-      - class_code      : coarse classification — 'SM' (Shipment), 'CM' (Customer
-                          Message), 'AI' (Shepherd's reply). This is the "Class" field.
-      - email_type      : direction of the email — 'Inbound' or 'Outbound'.
-                          (Distinct from the LLM's shipment_tender/quote/... labels,
-                          which describe content, not direction.)
-      - email_metadata  : JSONB blob of email context (to/cc, attachment names, etc.).
-                          Stored in a column literally named `metadata`.
-      - received_at     : when the email was received (inbound) or sent (outbound).
-      - created_at      : when this row was written (DB clock).
+      - id                : UUID primary key (generated app-side).
+      - client_id         : the resolved Hyperion customerId for the email, as text
+                            (nullable — not every email resolves to a client).
+      - conversation_id   : Graph/Outlook thread key that groups related messages.
+                            Empty for .eml files (no thread context).
+      - message_id        : unique per-message id (Graph message id, falls back to
+                            the RFC-2822 Internet-Message-Id).
+      - class_code        : coarse classification — 'SM' (Shipment), 'CM' (Customer
+                            Message), 'AI' (Shepherd's reply). This is the "Class" field.
+      - email_type        : direction of the email — 'Inbound' or 'Outbound'.
+                            (Distinct from the LLM's shipment_tender/quote/... labels,
+                            which describe content, not direction.)
+      - status            : lifecycle stage of the email record.
+                            'pending'   — seen in inbox, not yet processed (Phase 1).
+                            'processed' — pipeline completed (Phase 2).
+                            'failed'    — pipeline error.
+      - has_missing_fields: True when the shipment extracted from this email is still
+                            missing one or more required fields and a follow-up was sent.
+      - email_metadata    : JSONB blob of email context (to/cc, attachment names, etc.).
+                            Stored in a column literally named `metadata`.
+      - received_at       : when the email was received (inbound) or sent (outbound).
+      - created_at        : when this row was written (DB clock).
     """
     __tablename__ = "email_records"
 
@@ -47,6 +53,13 @@ class EmailRecord(Base):
 
     # "Class" field — column named class_code to avoid SQL reserved-word friction.
     class_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
+    # Lifecycle status — starts as 'pending' when first seen in inbox (Phase 1),
+    # updated to 'processed' or 'failed' after the pipeline runs (Phase 2).
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+
+    # True when a follow-up email was sent because required fields were missing.
+    has_missing_fields: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     sender_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
     sender_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
