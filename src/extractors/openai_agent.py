@@ -327,6 +327,68 @@ Return JSON only:
             logger.error(f"Error resolving customer ID via OpenAI: {e}")
             return None
 
+    # Categories that count as shipment-related (should be shown/processed).
+    SHIPMENT_EMAIL_TYPES = {
+        "shipment_tender", "shipment_quote", "tracking_request", "status_update",
+    }
+
+    def classify_email(self, subject: str, body_preview: str = "", sender: str = "") -> str:
+        """
+        Lightweight email classifier for the inbox list.
+
+        Judges an email from only its subject + body preview (no attachment OCR),
+        returning one of the same categories the full extractor uses:
+          shipment_tender | shipment_quote | tracking_request | status_update | spam | other
+
+        This lets the UI filter to shipment-related mail cheaply, before running
+        the heavy extraction pipeline. Falls back to 'other' on any error.
+        """
+        subject = (subject or "").strip()
+        preview = (body_preview or "").strip()[:800]  # cap tokens — a preview is enough
+
+        prompt = f"""You classify inbound freight-brokerage emails.
+
+From: {sender or "(unknown)"}
+Subject: {subject or "(no subject)"}
+Body preview:
+---
+{preview or "(no preview available)"}
+---
+
+Choose the single best category:
+- "shipment_tender": a load tender / booking request to move freight
+- "shipment_quote": a rate or quote request for freight
+- "tracking_request": asking for status/location of an existing shipment
+- "status_update": a notification about an active shipment (carrier assigned, in transit, etc.)
+- "spam": marketing, newsletters, product promos (e.g. Microsoft 365/Office/OneDrive),
+          system notifications, password/security, or anything with no freight intent
+- "other": invoices, bid-award/auction notices, or anything not fitting the above
+
+Return JSON only:
+{{"emailType": "<one of the categories above>"}}"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {"role": "system", "content": "You classify freight emails. Return valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content
+            if not content:
+                return "other"
+            email_type = (json.loads(content).get("emailType") or "other").strip().lower()
+            return email_type
+        except Exception as e:
+            logger.error(f"Error classifying email via OpenAI: {e}")
+            return "other"
+
+    def is_shipment_email(self, subject: str, body_preview: str = "", sender: str = "") -> bool:
+        """True when classify_email() returns a shipment-related category."""
+        return self.classify_email(subject, body_preview, sender) in self.SHIPMENT_EMAIL_TYPES
+
     def _deduplicate_items(self, shipment: Shipment) -> Shipment:
         """If TAG-level items exist, drop summary-level PO/SO line items."""
         items = shipment.required_fields.items
