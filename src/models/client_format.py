@@ -177,7 +177,8 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
         length, width, height = _parse_dimensions(item.dimensions)
         # Brokerware rejects null for decimal fields — only include them when available
         item_dict: dict = {
-            "productDescription": item.description,
+            # Fall back to "General Freight" when LLM didn't extract a description
+            "productDescription": item.description or "General Freight",
             "class":              "100",  # default; Brokerware requires a non-null value
             "pieces":             int(item.pieces) if item.pieces is not None else 1,
             "weight":             item.weight if item.weight is not None else 0,
@@ -191,6 +192,18 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
         if height is not None:
             item_dict["height"] = height
         items.append(item_dict)
+
+    # Brokerware requires at least one item — add a placeholder when none were extracted
+    if not items:
+        total_weight = rf.total_weight or 0
+        items = [{
+            "productDescription": "General Freight",
+            "class":              "100",
+            "pieces":             1,
+            "weight":             total_weight,
+            "isHazardous":        False,
+            "packaging":          "truckloads",
+        }]
 
     # ── Carrier ──────────────────────────────────────────────────────────────
     carrier_val = ntf.carrier
@@ -225,9 +238,12 @@ def format_client_json(shipment: Shipment, customer_id: Optional[int] = None) ->
         "shipperEmail":    ntf.pickup_contact.email if ntf.pickup_contact else None,
         "shipperPhone":    ntf.pickup_contact.phone if ntf.pickup_contact else None,
 
-        # Consignee details
-        "consigneeAddress": drop_addr.street if drop_addr else None,
-        "consigneeName":    drop.name if drop else None,
+        # Consignee details — fall back to city+state when street is absent
+        "consigneeAddress": (
+            drop_addr.street if (drop_addr and drop_addr.street)
+            else (f"{drop_addr.city}, {drop_addr.state}" if drop_addr and drop_addr.city else None)
+        ),
+        "consigneeName":    (drop.name if drop and drop.name else rf.customer_name),
         "consigneeContact": ntf.drop_contact.name  if ntf.drop_contact else None,
         "consigneeEmail":   ntf.drop_contact.email if ntf.drop_contact else None,
         "consigneePhone":   ntf.drop_contact.phone if ntf.drop_contact else None,
