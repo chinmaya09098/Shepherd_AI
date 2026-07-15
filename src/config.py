@@ -82,6 +82,36 @@ class Config:
     # Azure Storage Queue used by Function App for async email processing
     AZURE_STORAGE_QUEUE_NAME: str = os.getenv("AZURE_STORAGE_QUEUE_NAME", "email-notifications")
 
+    # Follow-up reminder settings
+    # FOLLOWUP_MAX_BY_CUSTOMER: JSON mapping of customer_id (str) → max follow-ups (int)
+    #   Supported values: 3, 5, or 7  (e.g. '{"101": 5, "202": 7}')
+    #   Any customer not listed falls back to FOLLOWUP_DEFAULT_MAX.
+    FOLLOWUP_MAX_BY_CUSTOMER: str = os.getenv("FOLLOWUP_MAX_BY_CUSTOMER", "{}")
+    FOLLOWUP_DEFAULT_MAX: int = int(os.getenv("FOLLOWUP_DEFAULT_MAX", "3"))
+    # How often the timer trigger re-sends reminder follow-ups.
+    # Set to 5 for testing (every 5 minutes); use 1440 for production (24 hours).
+    FOLLOWUP_REMINDER_INTERVAL_MINUTES: int = int(os.getenv("FOLLOWUP_REMINDER_INTERVAL_MINUTES", "5"))
+
+    @classmethod
+    def get_max_followups(cls, customer_id: Optional[int]) -> int:
+        """Return the configured max follow-up count for a given customer_id.
+
+        Looks up FOLLOWUP_MAX_BY_CUSTOMER (a JSON dict keyed by customer_id as
+        a string). Falls back to FOLLOWUP_DEFAULT_MAX (default 3) when the
+        customer is not listed.  Supported per-customer values: 3, 5, or 7.
+        """
+        import json as _json
+        if customer_id is None:
+            return cls.FOLLOWUP_DEFAULT_MAX
+        try:
+            mapping = _json.loads(cls.FOLLOWUP_MAX_BY_CUSTOMER or "{}")
+            val = mapping.get(str(customer_id))
+            if val is not None:
+                return int(val)
+        except Exception:
+            pass
+        return cls.FOLLOWUP_DEFAULT_MAX
+
     # Azure AI Search — separate index for RAG context retrieval
     AZURE_SEARCH_CONTEXT_INDEX_NAME: str = os.getenv(
         "AZURE_SEARCH_CONTEXT_INDEX_NAME", "shipment-context"

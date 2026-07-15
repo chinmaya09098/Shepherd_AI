@@ -2337,12 +2337,14 @@ def _display_missing_fields_form(shipment_idx: int):
                         with st.spinner("Generating and sending follow-up email..."):
                             try:
                                 orchestrator = FollowupOrchestrator()
+                                _sd = st.session_state.shipments[shipment_idx]
                                 result = run_async(
                                     orchestrator.handle_initial_extraction(
                                         shipment=shipment,
                                         message=current_message,
                                         graph_client=client,
                                         access_token=graph_token.access_token,
+                                        customer_id=_get_customer_id(_sd),
                                     )
                                 )
                                 st.session_state.followup_results[shipment_idx] = result

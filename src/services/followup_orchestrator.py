@@ -99,6 +99,7 @@ class FollowupOrchestrator:
         message:      MailMessage,
         graph_client: GraphClient,
         access_token: str,
+        customer_id:  Optional[int] = None,
     ) -> FollowupResult:
         """
         Called after extracting a shipment from a customer's email.
@@ -119,6 +120,10 @@ class FollowupOrchestrator:
         ref_ids      = _extract_reference_ids(shipment)
         blocking     = self._blocking(shipment.missing_required_fields)
 
+        # ── Resolve per-customer follow-up limit ──────────────────────────
+        from src.config import Config as _Config
+        max_followups = _Config.get_max_followups(customer_id)
+
         # ── Register conversation (first-touch tracking) ──────────────────
         state = ConversationState(
             conversation_id   = conv_id,
@@ -133,6 +138,8 @@ class FollowupOrchestrator:
             partial_shipment  = shipment.model_dump(by_alias=True, mode="json"),
             missing_fields    = shipment.missing_required_fields,
             followup_count    = 0,
+            max_followups     = max_followups,
+            customer_id       = customer_id,
             status            = "processing",
         )
         state.add_event(

@@ -453,6 +453,7 @@ def _run_email_pipeline(message_id: str) -> None:
                     message=mail_message,
                     graph_client=graph_client,
                     access_token=access_token,
+                    customer_id=customer_id,
                 )
             )
 
@@ -677,7 +678,107 @@ def _create_and_confirm_shipment(
 
 
 # ---------------------------------------------------------------------------
-# Trigger 3 — Timer: renew subscriptions every 47 hours
+# Trigger 3 — Timer: send reminder follow-ups every 5 minutes (testing)
+# ---------------------------------------------------------------------------
+
+@app.timer_trigger(
+    schedule="0 */5 * * * *",   # every 5 minutes
+    arg_name="timer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def send_reminder_followups(timer: func.TimerRequest) -> None:
+    """
+    Finds every conversation in 'awaiting_reply' status where the customer has
+    not replied within FOLLOWUP_REMINDER_INTERVAL_MINUTES (default 5 min for
+    testing; set to 1440 for 24-hour production cadence) and sends another
+    reminder reply in the same email thread.
+
+    Per-customer limits (3 / 5 / 7 follow-ups) are enforced by
+    ConversationState.max_followups, which is set at conversation creation
+    time using Config.FOLLOWUP_MAX_BY_CUSTOMER.
+
+    Conversations that have already reached their limit are skipped and their
+    status is updated to 'max_retries_reached'.
+    """
+    import asyncio
+    from src.config import Config
+    from src.services.conversation_tracker import ConversationTracker
+    from src.services.followup_orchestrator import FollowupOrchestrator
+
+    logger.info("Timer trigger: sending reminder follow-up emails")
+
+    tracker         = ConversationTracker()
+    orchestrator    = FollowupOrchestrator()
+    threshold_min   = Config.FOLLOWUP_REMINDER_INTERVAL_MINUTES
+    threshold_hours = threshold_min / 60.0          # list_stale works in hours
+
+    stale_conversations = tracker.list_stale(threshold_hours=threshold_hours)
+    logger.info(
+        "Found %d conversation(s) awaiting reply for > %d min",
+        len(stale_conversations), threshold_min,
+    )
+
+    if not stale_conversations:
+        logger.info("No stale conversations — nothing to remind")
+        return
+
+    graph_client = _get_graph_client()
+    try:
+        access_token = _get_app_token()
+    except Exception as exc:
+        logger.error("Could not obtain app token for reminder follow-ups: %s", exc)
+        return
+
+    sent = skipped = failed = 0
+    for state in stale_conversations:
+        try:
+            result = asyncio.run(
+                orchestrator.send_timeout_followup(
+                    state=state,
+                    graph_client=graph_client,
+                    access_token=access_token,
+                )
+            )
+            if result.action == "followup_sent":
+                sent += 1
+                logger.info(
+                    "Reminder #%d sent in thread conv=%s "
+                    "(customer_id=%s, %d/%d follow-ups used)",
+                    result.followup_count,
+                    state.conversation_id[:20],
+                    state.customer_id,
+                    result.followup_count,
+                    state.max_followups,
+                )
+            elif result.action == "max_retries":
+                skipped += 1
+                logger.info(
+                    "Conv %s hit max follow-ups (%d) — no further reminders",
+                    state.conversation_id[:20],
+                    state.max_followups,
+                )
+            else:
+                failed += 1
+                logger.warning(
+                    "Unexpected action '%s' for conv=%s: %s",
+                    result.action, state.conversation_id[:20], result.message,
+                )
+        except Exception as exc:
+            failed += 1
+            logger.error(
+                "Error sending reminder for conv=%s: %s",
+                state.conversation_id[:20], exc, exc_info=True,
+            )
+
+    logger.info(
+        "Reminder run complete: sent=%d skipped(max_retries)=%d failed=%d",
+        sent, skipped, failed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trigger 4 — Timer: renew subscriptions every 47 hours
 # ---------------------------------------------------------------------------
 
 @app.timer_trigger(
@@ -719,7 +820,7 @@ def renew_subscriptions(timer: func.TimerRequest) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Trigger 4 — Admin: register webhook subscriptions (HTTP, function-level auth)
+# Trigger 5 — Admin: register webhook subscriptions (HTTP, function-level auth)
 # ---------------------------------------------------------------------------
 
 @app.route(route="register_webhooks", auth_level=func.AuthLevel.FUNCTION)

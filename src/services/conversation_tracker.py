@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -206,6 +207,34 @@ class ConversationTracker:
                     pass
 
         return active
+
+    def list_stale(self, threshold_hours: int = 24) -> List[ConversationState]:
+        """Return awaiting_reply conversations that have not been updated within
+        threshold_hours and are still below their max_followups limit.
+
+        Used by the reminder timer trigger to decide which threads need another
+        nudge email sent to the customer.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=threshold_hours)
+        stale: List[ConversationState] = []
+        for state in self.list_active():
+            # Skip conversations that already hit their retry ceiling
+            if state.followup_count >= state.max_followups:
+                continue
+            # Use last_followup_at if set, otherwise fall back to when the
+            # conversation was created (i.e. the original follow-up was never sent)
+            last_activity_str = state.last_followup_at or state.created_at
+            try:
+                last_dt = datetime.fromisoformat(last_activity_str)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                # Unparseable timestamp — treat as stale to be safe
+                stale.append(state)
+                continue
+            if last_dt < cutoff:
+                stale.append(state)
+        return stale
 
     # ── Fallback correlation ──────────────────────────────────────────────
 

@@ -86,6 +86,10 @@ class ConversationState(BaseModel):
     missing_fields: List[str] = Field(default_factory=list)
     """Field keys still missing after the last extraction / merge."""
 
+    # ── Customer identity ─────────────────────────────────────────────────
+    customer_id: Optional[int] = None
+    """Resolved HyperionTMS customerId — drives per-customer max_followups."""
+
     # ── Follow-up tracking ────────────────────────────────────────────────
     followup_count: int = 0
     max_followups: int = 3
