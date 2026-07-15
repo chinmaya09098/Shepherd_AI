@@ -973,7 +973,9 @@ _NON_SHIPMENT_SUBJECT_KEYWORDS = [
     "% off", "save now", "limited time",
     "verify your email", "confirm your email", "reset your password",
     "security alert", "sign in to", "your account",
-    "welcome to microsoft", "office 365", "azure portal",
+    "welcome to microsoft", "office 365", "microsoft 365", "azure portal",
+    "onedrive", "outlook", "sharepoint", "get started with",
+    "productivity with", "work together", "organize your day",
     "linkedin", "facebook", "twitter",
     "invoice from", "receipt from",                # accounting, not freight
 ]
@@ -988,6 +990,7 @@ _SHIPMENT_SUBJECT_KEYWORDS = [
     "tracking", "ship via",
     "carrierpoint", "brokerware", "shipmind",
     "booking", "booking confirmation",
+    "customer:",                                    # forwarded load tenders (e.g. "Fw: Customer: ...")
     "pu ", "p/u", "del ", "d/o",                  # shorthand used in freight
     "fw:", "fwd:", "re:",                           # forwarded / replied freight threads
 ]
@@ -1000,15 +1003,14 @@ _SHIPMENT_SENDER_FRAGMENTS = [
 ]
 
 
-def _is_likely_shipment_email(msg: MailMessage) -> bool:
+def _heuristic_shipment_verdict(msg: MailMessage) -> Optional[bool]:
     """
-    Return True if the email is likely shipment-related.
+    Fast, free pre-filter on subject/body-preview/sender.
 
-    Uses a two-stage heuristic:
-      1. Hard-exclude known non-logistics senders and subject patterns.
-      2. Positively match shipment keywords in subject, body preview, or sender.
-    Defaults to True (show) if no signal is found, to avoid hiding edge-case
-    freight emails that don't contain standard keywords.
+    Returns:
+      True  — clearly shipment-related (strong keyword or logistics sender)
+      False — clearly NOT shipment (known marketing/system sender or subject)
+      None  — ambiguous; the caller should defer to the AI classifier
     """
     subject  = (msg.subject or "").lower()
     preview  = (msg.body_preview or "").lower()
@@ -1018,32 +1020,70 @@ def _is_likely_shipment_email(msg: MailMessage) -> bool:
         sender = (msg.from_.email_address.address or "").lower()
         sender_domain = sender.split("@")[-1] if "@" in sender else ""
 
-    # ── Stage 1: hard exclusions ─────────────────────────────────────────
+    # ── Clearly NOT shipment ─────────────────────────────────────────────
     if sender_domain in _NON_SHIPMENT_DOMAINS:
         return False
-
-    # Generic no-reply / system senders (Microsoft notifications, etc.)
     if any(s in sender for s in ("noreply@", "no-reply@", "donotreply@", "mailer-daemon@")):
         return False
-
     if any(kw in subject for kw in _NON_SHIPMENT_SUBJECT_KEYWORDS):
         return False
 
-    # ── Stage 2: positive match ──────────────────────────────────────────
+    # ── Clearly shipment ─────────────────────────────────────────────────
     combined = subject + " " + preview
     if any(kw in combined for kw in _SHIPMENT_SUBJECT_KEYWORDS):
         return True
-
     if any(frag in sender for frag in _SHIPMENT_SENDER_FRAGMENTS):
         return True
 
-    # ── Default: show (conservative — don't hide ambiguous emails) ───────
-    return True
+    # ── Ambiguous — let the AI classifier decide ─────────────────────────
+    return None
+
+
+def _msg_sender(msg: MailMessage) -> str:
+    if msg.from_ and msg.from_.email_address:
+        return (msg.from_.email_address.address or "")
+    return ""
 
 
 def _filter_shipment_emails(messages: List[MailMessage]) -> List[MailMessage]:
-    """Filter a list of MailMessage objects to likely shipment-related emails only."""
-    return [m for m in messages if _is_likely_shipment_email(m)]
+    """
+    Filter to shipment-related emails using a hybrid strategy:
+      1. Fast keyword/sender heuristic decides the obvious cases for free.
+      2. Ambiguous emails are sent to the backend AI classifier
+         (OpenAIAgent.classify_email) — judged from subject + body preview only,
+         no attachment OCR — so the same taxonomy as full extraction is used.
+
+    AI verdicts are cached per message id in session_state so Streamlit reruns
+    don't re-classify. On any AI error we fail open (show the email) rather than
+    risk hiding a genuine freight email.
+    """
+    cache: dict = st.session_state.setdefault("_email_class_cache", {})
+    agent: Optional[OpenAIAgent] = None
+    kept: List[MailMessage] = []
+
+    for m in messages:
+        verdict = _heuristic_shipment_verdict(m)
+
+        if verdict is None:  # ambiguous → AI classifier (cached)
+            key = m.id or f"{m.subject}|{_msg_sender(m)}"
+            if key in cache:
+                verdict = cache[key]
+            else:
+                try:
+                    if agent is None:
+                        agent = OpenAIAgent()
+                    verdict = agent.is_shipment_email(
+                        m.subject or "", m.body_preview or "", _msg_sender(m)
+                    )
+                except Exception as e:
+                    logger.warning("AI email classification failed (%s) — showing by default", e)
+                    verdict = True  # fail open: don't hide a possibly-real freight email
+                cache[key] = verdict
+
+        if verdict:
+            kept.append(m)
+
+    return kept
 
 
 _CORRELATION_METHOD_LABELS = {
@@ -2297,12 +2337,14 @@ def _display_missing_fields_form(shipment_idx: int):
                         with st.spinner("Generating and sending follow-up email..."):
                             try:
                                 orchestrator = FollowupOrchestrator()
+                                _sd = st.session_state.shipments[shipment_idx]
                                 result = run_async(
                                     orchestrator.handle_initial_extraction(
                                         shipment=shipment,
                                         message=current_message,
                                         graph_client=client,
                                         access_token=graph_token.access_token,
+                                        customer_id=_get_customer_id(_sd),
                                     )
                                 )
                                 st.session_state.followup_results[shipment_idx] = result
