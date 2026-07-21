@@ -25,7 +25,9 @@ from src.extractors.openai_agent import OpenAIAgent
 from src.models.shipment import Shipment, LocationInfo, ShipmentAddress
 from src.models.client_format import format_client_json_str
 from src.services.hyperion_client import resolve_customer_id
-from src.services.search_client import find_customer_matches
+# Customer matching now uses Brokerware's CustomerContactsSummary (replaces the
+# Hyperion + Azure AI Search vector-search path). Aliased so call sites are unchanged.
+from src.services.brokerware_client import match_customer as find_customer_matches
 from src.db.email_repository import record_email
 from src.utils.blob_log_handler import BlobLogHandler
 from src.utils.logger import get_logger
