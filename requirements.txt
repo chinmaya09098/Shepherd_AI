@@ -27,3 +27,7 @@ python-dateutil>=2.8.2
 
 # UI
 streamlit>=1.28.0
+
+# Azure Key Vault (secrets management)
+azure-identity
+azure-keyvault-secrets
