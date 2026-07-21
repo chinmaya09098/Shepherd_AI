@@ -5,15 +5,28 @@ import os
 from dotenv import load_dotenv
 from typing import Optional
 
+from src.secrets import load_secrets_from_keyvault
+
 # Load environment variables from .env file.
 # override=True makes the project's .env the source of truth even when a
 # variable of the same name already exists in the OS environment (e.g. a stray
 # DATABASE_URL pointing at localhost).
 load_dotenv(override=True)
 
+# If KEY_VAULT_URL is configured, pull secrets from Azure Key Vault into the
+# environment (overriding .env). No-op when KEY_VAULT_URL is unset, so local
+# development keeps using .env exactly as before. Must run before the Config
+# attributes below are evaluated at import time.
+load_secrets_from_keyvault()
+
 
 class Config:
     """Configuration class for Azure services"""
+    
+    # Azure Key Vault (optional). When set, secrets are sourced from the vault
+    # instead of .env — see src/secrets.py. Example:
+    #   KEY_VAULT_URL=https://shepherd-ai-kv.vault.azure.net/
+    KEY_VAULT_URL: Optional[str] = os.getenv("KEY_VAULT_URL")
     
     # Azure OpenAI Configuration
     AZURE_OPENAI_ENDPOINT: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
