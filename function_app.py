@@ -281,7 +281,7 @@ def _run_email_pipeline(message_id: str) -> None:
     from src.services.followup_orchestrator import FollowupOrchestrator
     from src.services.graph_client import GraphClient, get_app_token
     from src.services.hitl_router import HITLRouter
-    from src.services.search_client import find_customer_matches
+    from src.services.brokerware_client import match_customer as find_customer_matches
     from src.utils.blob_log_handler import BlobLogHandler
 
     # ── BlobLogHandler — buffer all shepherd_ai logs for this pipeline run ────
