@@ -27,7 +27,7 @@ class Config:
     # instead of .env — see src/secrets.py. Example:
     #   KEY_VAULT_URL=https://shepherd-ai-kv.vault.azure.net/
     KEY_VAULT_URL: Optional[str] = os.getenv("KEY_VAULT_URL")
-    
+
     # Azure OpenAI Configuration
     AZURE_OPENAI_ENDPOINT: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
     AZURE_OPENAI_KEY: Optional[str] = os.getenv("AZURE_OPENAI_KEY")
@@ -94,6 +94,32 @@ class Config:
 
     # Azure Storage Queue used by Function App for async email processing
     AZURE_STORAGE_QUEUE_NAME: str = os.getenv("AZURE_STORAGE_QUEUE_NAME", "email-notifications")
+
+    # ── Security layer ────────────────────────────────────────────────────────
+
+    # APIM — subscription key injected by API Management on every inbound request.
+    # Store the value in Key Vault as 'apim-subscription-key'.
+    # When unset, the guard logs a warning and passes traffic through (safe for
+    # initial deploy before the vault secret is populated).
+    APIM_SUBSCRIPTION_KEY: Optional[str] = os.getenv("APIM_SUBSCRIPTION_KEY")
+    # Header name APIM uses to forward the subscription key to the backend.
+    APIM_SUBSCRIPTION_KEY_HEADER: str = os.getenv(
+        "APIM_SUBSCRIPTION_KEY_HEADER", "Ocp-Apim-Subscription-Key"
+    )
+
+    # Application Insights — connection string for structured telemetry & audit.
+    # Store in Key Vault as 'applicationinsights-connection-string'.
+    APPLICATIONINSIGHTS_CONNECTION_STRING: Optional[str] = os.getenv(
+        "APPLICATIONINSIGHTS_CONNECTION_STRING"
+    )
+
+    # RBAC — comma-separated list of Azure AD app roles allowed to call admin
+    # endpoints (register_webhooks, etc.).  Example: "WebhookAdmin,ShipmentProcessor"
+    RBAC_ADMIN_ROLES: str = os.getenv("RBAC_ADMIN_ROLES", "WebhookAdmin")
+
+    # Input validation limits (can be tuned via env vars without redeploying)
+    MAX_EMAIL_BODY_CHARS: int    = int(os.getenv("MAX_EMAIL_BODY_CHARS",    "500000"))
+    MAX_ATTACHMENT_BYTES: int    = int(os.getenv("MAX_ATTACHMENT_BYTES",    "26214400"))  # 25 MB
 
     # Follow-up reminder settings
     # FOLLOWUP_MAX_BY_CUSTOMER: JSON mapping of customer_id (str) → max follow-ups (int)

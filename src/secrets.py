@@ -24,18 +24,28 @@ logger = logging.getLogger(__name__)
 # Map: Key Vault secret name  ->  environment variable name used by Config.
 # Only *secrets* belong here — endpoints/other non-sensitive config stay in .env.
 SECRET_MAP = {
+    # Azure OpenAI & cognitive services
     "azure-openai-key":                 "AZURE_OPENAI_KEY",
     "azure-content-understanding-key":  "AZURE_CONTENT_UNDERSTANDING_KEY",
+    # Storage & database
     "azure-storage-connection-string":  "AZURE_STORAGE_CONNECTION_STRING",
-    "azure-search-key":                 "AZURE_SEARCH_KEY",
     "database-url":                     "DATABASE_URL",
     "postgres-password":                "POSTGRES_PASSWORD",
+    # Search
+    "azure-search-key":                 "AZURE_SEARCH_KEY",
+    # Azure AD / Graph
     "azure-ad-client-secret":           "AZURE_AD_CLIENT_SECRET",
+    # TMS integrations
     "hyperion-client-id":               "HYPERION_CLIENT_ID",
     "hyperion-client-secret":           "HYPERION_CLIENT_SECRET",
     "brokerware-client-id":             "BROKERWARE_CLIENT_ID",
     "brokerware-client-secret":         "BROKERWARE_CLIENT_SECRET",
+    # Webhook security
     "graph-webhook-client-state":       "GRAPH_WEBHOOK_CLIENT_STATE",
+    # APIM subscription key (injected by APIM on every inbound request)
+    "apim-subscription-key":            "APIM_SUBSCRIPTION_KEY",
+    # Application Insights (telemetry & audit)
+    "applicationinsights-connection-string": "APPLICATIONINSIGHTS_CONNECTION_STRING",
 }
 
 

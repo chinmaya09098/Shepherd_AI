@@ -28,6 +28,13 @@ python-dateutil>=2.8.2
 # UI
 streamlit>=1.28.0
 
-# Azure Key Vault (secrets management)
-azure-identity
-azure-keyvault-secrets
+# Azure security — Key Vault + Managed Identity
+azure-identity>=1.17.0
+azure-keyvault-secrets>=4.8.0
+
+# Azure Monitor — Application Insights structured telemetry & audit
+applicationinsights>=0.11.10
+azure-monitor-opentelemetry>=1.2.0
+
+# Azure Storage Queue (used by webhook → queue pipeline)
+azure-storage-queue>=12.9.0
