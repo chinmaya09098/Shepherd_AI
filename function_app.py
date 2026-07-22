@@ -48,6 +48,25 @@ logger = logging.getLogger("shepherd_ai.function_app")
 
 
 # ---------------------------------------------------------------------------
+# Security helpers (lazy — imported on first call to avoid cold-start cost)
+# ---------------------------------------------------------------------------
+
+def _require_apim_key(req: func.HttpRequest, *, bypass: bool = False):
+    """Validate APIM subscription key. Returns HttpResponse(401) or None."""
+    from src.security.apim_guard import require_apim_key
+    return require_apim_key(req, bypass=bypass)
+
+
+def _audit(event: str, props: dict) -> None:
+    """Fire-and-forget audit event to Application Insights. Never raises."""
+    try:
+        from src.security.audit import emit
+        emit(event, props)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Helper: lazy imports (avoids cold-start cost for unused trigger paths)
 # ---------------------------------------------------------------------------
 
@@ -118,11 +137,12 @@ def graph_webhook(req: func.HttpRequest) -> func.HttpResponse:
     POST — Change notification: Microsoft sends a JSON payload describing which
            resources changed. Each notification is enqueued for async processing.
     """
-    # ── Validation handshake ─────────────────────────────────────────────────
+    # ── Validation handshake (GET — Microsoft sends this directly, not via APIM) ──
     if req.method == "GET":
         validation_token = req.params.get("validationToken")
         if validation_token:
             logger.info("Graph subscription validation handshake received")
+            _audit("webhook_validation_handshake", {"url": req.url})
             return func.HttpResponse(
                 body=validation_token,
                 status_code=200,
@@ -130,15 +150,24 @@ def graph_webhook(req: func.HttpRequest) -> func.HttpResponse:
             )
         return func.HttpResponse("Missing validationToken", status_code=400)
 
-    # ── Change notification ───────────────────────────────────────────────────
+    # ── Change notification (POST) ────────────────────────────────────────────
+
+    # Payload size guard — reject obviously oversized requests before parsing
+    raw_body = req.get_body()
+    if len(raw_body) > 1_048_576:  # 1 MB
+        logger.warning("Webhook payload too large (%d bytes) — rejected", len(raw_body))
+        _audit("webhook_payload_too_large", {"size_bytes": str(len(raw_body))})
+        return func.HttpResponse("Payload Too Large", status_code=413)
+
     try:
         body = req.get_json()
     except Exception as exc:
         logger.error("Failed to parse webhook notification body: %s", exc)
         return func.HttpResponse("Bad Request", status_code=400)
 
-    # Validate client state to reject spoofed notifications
+    # Layer 1: clientState validation (origin check — always applied)
     if not _validate_client_state(body):
+        _audit("webhook_client_state_mismatch", {"url": req.url})
         return func.HttpResponse("Forbidden — invalid clientState", status_code=403)
 
     cfg        = _get_config()
@@ -292,6 +321,30 @@ def _run_email_pipeline(message_id: str) -> None:
         mail_message    = graph_client._parse_mail_message(msg_data)
         email_body      = (mail_message.body.content if mail_message.body else "") or ""
         email_body_text = re.sub(r"<[^>]+>", " ", email_body).strip()
+
+        # ── Security: input validation & sanitization ─────────────────────────
+        from src.security.input_validator import validate_email_body, sanitize_email_body
+        body_issues = validate_email_body(email_body_text)
+        if body_issues:
+            logger.warning(
+                "Email body validation issues for message_id=%s: %s",
+                message_id, body_issues,
+            )
+            _audit("email_body_validation_issues", {
+                "message_id": message_id,
+                "issues": "; ".join(body_issues),
+            })
+        # Always sanitize before passing to LLM
+        email_body_text = sanitize_email_body(email_body_text)
+
+        # ── Security: prompt injection scan ──────────────────────────────────
+        from src.security.prompt_guard import scan as prompt_scan
+        injection_hits = prompt_scan(email_body_text)
+        if injection_hits:
+            logger.warning(
+                "Prompt injection patterns in message_id=%s: %s",
+                message_id, injection_hits,
+            )
 
         # Build a minimal email_data dict compatible with email_repository.record_email()
         sender_str = ""
@@ -527,6 +580,15 @@ def _run_email_pipeline(message_id: str) -> None:
         except Exception as exc:
             logger.warning("Email record persistence failed (non-fatal): %s", exc)
 
+        # ── 12c. Security audit event ─────────────────────────────────────────
+        _audit("email_processed", {
+            "message_id":     message_id,
+            "pipeline_stage": pipeline_stage,
+            "customer_id":    str(customer_id) if customer_id else "",
+            "sender":         sender_str,
+            "mailbox":        receiver_email,
+        })
+
         # ── 12b. Blob log upload [SOW §11] ────────────────────────────────────
         try:
             from azure.storage.blob import BlobServiceClient as _BlobSvcClient
@@ -682,7 +744,7 @@ def _create_and_confirm_shipment(
 # ---------------------------------------------------------------------------
 
 @app.timer_trigger(
-    schedule="0 */5 * * * *",   # every 5 minutes
+    schedule="%FOLLOWUP_TIMER_SCHEDULE%",   # set in Azure App Settings: "0 0 */24 * * *" for production (daily), "0 */5 * * * *" for testing
     arg_name="timer",
     run_on_startup=False,
     use_monitor=True,
@@ -839,6 +901,22 @@ def register_webhooks(req: func.HttpRequest) -> func.HttpResponse:
         200 JSON: {"subscription_id": "...", "status": "registered"}
         500 JSON: {"error": "..."}
     """
+    # ── Security: APIM subscription key ──────────────────────────────────────
+    err = _require_apim_key(req)
+    if err:
+        return err
+
+    # ── Security: RBAC — caller must hold WebhookAdmin role ──────────────────
+    from src.security.rbac import require_role
+    err = require_role(req, "WebhookAdmin")
+    if err:
+        return err
+
+    _audit("register_webhooks_called", {
+        "client_ip": req.headers.get("X-Forwarded-For", "unknown"),
+        "method":    req.method,
+    })
+
     body: Dict[str, Any] = {}
     try:
         body = req.get_json()
@@ -886,5 +964,22 @@ def register_webhooks(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps({"error": "Failed to register subscription — check logs for details"}),
         status_code=500,
+        mimetype="application/json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trigger 6 — Health check endpoint for App Gateway / APIM probes
+# ---------------------------------------------------------------------------
+
+@app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def health(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Lightweight health check endpoint for Azure App Gateway and APIM health probes.
+    Returns 200 OK when the Function App is running.
+    """
+    return func.HttpResponse(
+        json.dumps({"status": "healthy", "service": "shepherdai-funcapp"}),
+        status_code=200,
         mimetype="application/json",
     )

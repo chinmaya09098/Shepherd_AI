@@ -4,12 +4,17 @@
     "applicationInsights": {
       "samplingSettings": {
         "isEnabled": true,
-        "excludedTypes": "Request"
-      }
+        "maxTelemetryItemsPerSecond": 20,
+        "excludedTypes": "Exception;Trace"
+      },
+      "enableLiveDiagnostics": true
     },
     "logLevel": {
       "default": "Information",
-      "shepherd_ai": "Debug"
+      "shepherd_ai": "Debug",
+      "shepherd_ai.security": "Information",
+      "azure.core": "Warning",
+      "azure.identity": "Warning"
     }
   },
   "extensions": {
@@ -27,5 +32,18 @@
       "dynamicThrottlesEnabled": true
     }
   },
-  "functionTimeout": "00:10:00"
+  "functionTimeout": "00:10:00",
+  "healthMonitor": {
+    "enabled": true,
+    "healthCheckInterval": "00:00:10",
+    "healthCheckWindow": "00:02:00",
+    "healthCheckThreshold": 6,
+    "counterThreshold": 0.80
+  },
+  "retry": {
+    "strategy": "exponentialBackoff",
+    "maxRetryCount": 3,
+    "minimumInterval": "00:00:02",
+    "maximumInterval": "00:00:30"
+  }
 }
