@@ -2,9 +2,16 @@
 Conversation tracker — persists, retrieves, and correlates ConversationState objects.
 
 Storage:
-  Primary  : Azure Blob Storage  (conversation-states/<id>.json)
+  Primary  : Azure Blob Storage  ({scope}/conversation-states/<id>.json)
   Fallback : Local JSON files    (OUTPUT_DIR/conversation_states/<id>.json)
   Cache    : Module-level dict   (survives Streamlit reruns within one process)
+
+Blob path scoping:
+  When TENANT_ID_SCOPE is set (or state.tenant_id is non-None), blobs are stored
+  under "{scope}/conversation-states/".  When blank (default), the legacy
+  unscoped path "conversation-states/" is used for backward compatibility.
+  load() also performs a legacy fallback so existing blobs are found after a
+  TENANT_ID_SCOPE is first introduced.
 
 Correlation strategies (in priority order):
   1. conversation_id  — exact Graph conversationId match          (confidence 1.0)
@@ -27,11 +34,24 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_BLOB_PREFIX  = "conversation-states/"
-_LOCAL_DIR    = (
+_LOCAL_DIR = (
     Path(Config.OUTPUT_DIR if hasattr(Config, "OUTPUT_DIR") else "output")
     / "conversation_states"
 )
+
+
+def _blob_prefix(tenant_id: Optional[str] = None) -> str:
+    """Return the blob path prefix, optionally scoped to a tenant.
+
+    When TENANT_ID_SCOPE is configured (or a non-None tenant_id is supplied),
+    blobs are stored under "{scope}/conversation-states/" so multiple tenants
+    share one storage container without collisions.  An empty scope uses the
+    legacy unscoped "conversation-states/" path for backward compatibility.
+    """
+    scope = tenant_id or Config.TENANT_ID_SCOPE
+    if scope:
+        return f"{scope}/conversation-states/"
+    return "conversation-states/"
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +137,7 @@ class ConversationTracker:
         """
         self._cache[state.conversation_id] = state
 
-        blob_client = self._get_blob_client(state.conversation_id)
+        blob_client = self._get_blob_client(state.conversation_id, tenant_id=state.tenant_id)
         if blob_client:
             try:
                 blob_client.upload_blob(state.model_dump_json(indent=2), overwrite=True)
@@ -143,19 +163,26 @@ class ConversationTracker:
     # ── Read ─────────────────────────────────────────────────────────────
 
     def load(self, conversation_id: str) -> Optional[ConversationState]:
-        """Load by exact conversation_id. Checks cache → blob → local disk."""
+        """Load by exact conversation_id. Checks cache → blob (scoped then legacy) → local disk."""
         if conversation_id in self._cache:
             return self._cache[conversation_id]
 
-        blob_client = self._get_blob_client(conversation_id)
-        if blob_client:
-            try:
-                data  = blob_client.download_blob().readall()
-                state = ConversationState.model_validate_json(data)
-                self._cache[conversation_id] = state
-                return state
-            except Exception:
-                pass
+        # Try tenant-scoped blob first, then fall back to the legacy unscoped path.
+        # This ensures existing blobs written before TENANT_ID_SCOPE was introduced
+        # are still found after the scope is first set.
+        for tenant_scope in [None, ""]:  # None → uses Config.TENANT_ID_SCOPE; "" → legacy
+            blob_client = self._get_blob_client(conversation_id, tenant_id=tenant_scope)
+            if blob_client:
+                try:
+                    data  = blob_client.download_blob().readall()
+                    state = ConversationState.model_validate_json(data)
+                    self._cache[conversation_id] = state
+                    return state
+                except Exception:
+                    pass
+            # If scoped == legacy path (TENANT_ID_SCOPE is already ""), don't try twice
+            if not Config.TENANT_ID_SCOPE:
+                break
 
         path = _LOCAL_DIR / f"{_safe_filename(conversation_id)}.json"
         if path.exists():
@@ -374,14 +401,22 @@ class ConversationTracker:
     # ── Helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _get_blob_client(conversation_id: str):
+    def _get_blob_client(conversation_id: str, tenant_id: Optional[str] = None):
+        """Return a BlobClient for the conversation state blob.
+
+        Args:
+            conversation_id: The conversation's unique ID (used as filename).
+            tenant_id:       Override tenant scope. Pass None to use
+                             Config.TENANT_ID_SCOPE; pass "" to force the
+                             legacy unscoped path.
+        """
         if not Config.AZURE_STORAGE_CONNECTION_STRING:
             return None
         try:
             from azure.storage.blob import BlobServiceClient
-            service    = BlobServiceClient.from_connection_string(Config.AZURE_STORAGE_CONNECTION_STRING)
-            container  = Config.AZURE_STORAGE_LOGS_CONTAINER or "processed-logs"
-            blob_name  = f"{_BLOB_PREFIX}{_safe_filename(conversation_id)}.json"
+            service   = BlobServiceClient.from_connection_string(Config.AZURE_STORAGE_CONNECTION_STRING)
+            container = Config.AZURE_STORAGE_LOGS_CONTAINER or "processed-logs"
+            blob_name = f"{_blob_prefix(tenant_id)}{_safe_filename(conversation_id)}.json"
             return service.get_blob_client(container=container, blob=blob_name)
         except Exception as exc:
             logger.debug("Could not create blob client: %s", exc)

@@ -86,9 +86,25 @@ def get_engine() -> Optional[Engine]:
         )
         return None
 
-    _engine = create_engine(url, pool_pre_ping=True, future=True)
+    _engine = create_engine(
+        url,
+        pool_pre_ping=True,
+        future=True,
+        # Connection pool tuning — configurable via env vars (see Config).
+        # Defaults: pool_size=5, max_overflow=10, pool_timeout=30, pool_recycle=300.
+        # Increase pool_size / max_overflow for high-concurrency Function App instances.
+        pool_size=Config.DB_POOL_SIZE,
+        max_overflow=Config.DB_MAX_OVERFLOW,
+        pool_timeout=Config.DB_POOL_TIMEOUT,
+        pool_recycle=Config.DB_POOL_RECYCLE,
+    )
     _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False, class_=Session)
-    logger.info("PostgreSQL engine created")
+    logger.info(
+        "PostgreSQL engine created (pool_size=%d max_overflow=%d pool_recycle=%ds)",
+        Config.DB_POOL_SIZE,
+        Config.DB_MAX_OVERFLOW,
+        Config.DB_POOL_RECYCLE,
+    )
     return _engine
 
 

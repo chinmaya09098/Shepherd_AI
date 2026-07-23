@@ -1,7 +1,7 @@
 """
 Azure AI Search client for Semantic Context Retrieval (RAG).
 
-Indexes reference data from HyperionTMS (carriers, locations, products,
+Indexes reference data from Brokerware/TMS (carriers, locations, products,
 routing rules) into a dedicated ``shipment-context`` search index, then
 retrieves the most relevant snippets before each OpenAI extraction call.
 The snippets are injected into the extraction prompt so the model has
@@ -258,6 +258,6 @@ class ShipmentContextClient:
             return ""
         lines = "\n".join(f"  - {s}" for s in snippets)
         return (
-            "\nREFERENCE CONTEXT (from HyperionTMS knowledge base — use to "
+            "\nREFERENCE CONTEXT (from TMS knowledge base — use to "
             "fill or validate extracted values):\n" + lines + "\n"
         )

@@ -15,6 +15,10 @@ renew_subscriptions Timer (every 47 hours)
     Calls WebhookSubscriptionManager.renew() for all active subscriptions so
     they never expire.
 
+poll_inbox_fallback Timer (every 2 minutes, configurable via POLL_INBOX_SCHEDULE)
+    Polling fallback that fetches new inbox messages via Graph API and enqueues
+    any not already tracked. Guards against dropped webhook notifications.
+
 register_webhooks   HTTP (admin, function-level auth)
     One-shot endpoint to create the initial Graph subscription for a mailbox.
     Call this after deploying the Function App for the first time.
@@ -30,6 +34,15 @@ Environment variables (set in Function App Configuration or local.settings.json)
     AZURE_SEARCH_CONTEXT_INDEX_NAME
 """
 from __future__ import annotations
+
+# Bootstrap .env for local development BEFORE the timer-trigger decorators
+# evaluate their schedule strings via os.getenv().  This is a no-op when
+# running inside Azure Functions (App Settings are already in os.environ).
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(override=False)  # Don't override App Settings already set
+except ImportError:
+    pass
 
 import json
 import logging
@@ -55,6 +68,49 @@ def _require_apim_key(req: func.HttpRequest, *, bypass: bool = False):
     """Validate APIM subscription key. Returns HttpResponse(401) or None."""
     from src.security.apim_guard import require_apim_key
     return require_apim_key(req, bypass=bypass)
+
+
+def _is_already_processing(message_id: str) -> bool:
+    """
+    Check / create a dedup marker blob for *message_id*.
+
+    Returns True  — a marker already exists; the message has already been
+                    queued or is being processed; skip it.
+    Returns False — no marker found; one is written atomically and the caller
+                    should proceed with processing.
+
+    On any storage error the function returns False so messages are never
+    silently dropped: it is safer to process a duplicate than to miss one.
+    The marker is a tiny JSON blob stored at
+    ``processed-logs/dedup/{message_id}`` in Azure Blob Storage.
+    """
+    try:
+        from src.config import Config
+        conn_str = Config.AZURE_STORAGE_CONNECTION_STRING
+        if not conn_str:
+            return False
+        from azure.storage.blob import BlobServiceClient
+        svc  = BlobServiceClient.from_connection_string(conn_str)
+        blob = svc.get_blob_client(
+            container="processed-logs",
+            blob=f"dedup/{message_id}",
+        )
+        try:
+            blob.get_blob_properties()   # raises ResourceNotFoundError if absent
+            return True                  # marker exists — already processing/processed
+        except Exception:
+            # Marker not found — create it to claim this message_id
+            blob.upload_blob(
+                json.dumps({"queued_at": datetime.now(timezone.utc).isoformat()}),
+                overwrite=False,         # overwrite=False is atomic: fails if someone else raced us
+            )
+            return False
+    except Exception as exc:
+        logger.warning(
+            "Dedup check failed for message_id=%s: %s — processing anyway",
+            message_id, exc,
+        )
+        return False  # fail open: never silently drop a message
 
 
 def _audit(event: str, props: dict) -> None:
@@ -193,9 +249,11 @@ def graph_webhook(req: func.HttpRequest) -> func.HttpResponse:
 
             envelope: Dict[str, Any] = {
                 "message_id":       message_id,
+                "mailbox_user_id":  cfg.GRAPH_MAILBOX_USER_ID or "",
                 "subscription_id":  notification.get("subscriptionId"),
                 "change_type":      notification.get("changeType"),
                 "received_at":      datetime.now(timezone.utc).isoformat(),
+                "source":           "webhook",
             }
             queue_client.send_message(json.dumps(envelope))
             enqueued += 1
@@ -233,15 +291,27 @@ def process_email(msg: func.QueueMessage) -> None:
         logger.error("Failed to decode queue message: %s", exc)
         return
 
-    message_id = envelope.get("message_id", "")
+    message_id      = envelope.get("message_id", "")
+    mailbox_user_id = envelope.get("mailbox_user_id", "")
+    source          = envelope.get("source", "webhook")
+
     if not message_id:
         logger.warning("Queue message missing message_id — skipping")
         return
 
-    logger.info("Processing email message_id=%s", message_id)
+    # Deduplication guard: skip if this message_id is already being / has been
+    # processed (handles duplicate webhook notifications and poll/webhook races).
+    if _is_already_processing(message_id):
+        logger.info(
+            "message_id=%s already queued/processed (source=%s) — skipping duplicate",
+            message_id, source,
+        )
+        return
+
+    logger.info("Processing email message_id=%s mailbox=%s source=%s", message_id, mailbox_user_id or "default", source)
 
     try:
-        _run_email_pipeline(message_id)
+        _run_email_pipeline(message_id, mailbox_user_id=mailbox_user_id or None)
     except Exception as exc:
         logger.error(
             "Unhandled error in email pipeline for message_id=%s: %s",
@@ -250,7 +320,7 @@ def process_email(msg: func.QueueMessage) -> None:
         raise  # Re-raise so Azure Functions retries the message (up to maxDequeueCount)
 
 
-def _run_email_pipeline(message_id: str) -> None:
+def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) -> None:
     """
     Full Shepherd AI pipeline for one email message, executed inside the queue trigger.
 
@@ -261,12 +331,17 @@ def _run_email_pipeline(message_id: str) -> None:
       4.  Retrieve RAG context from Azure AI Search (ShipmentContextClient).
       5.  Run OpenAI extraction — Pass 1 envelope + Pass 2 per-attachment or body fallback.
       6.  Classification routing — discard spam; skip creation for tracking/status emails.
-      7.  Resolve HyperionTMS customer ID via Azure AI Search + OpenAI confirmation.
+      7.  Resolve Brokerware customer ID via CustomerContactsSummary API + OpenAI confirmation.
       8.  Pre-submission field validation — log structural warnings.          [SOW §8]
       9.  Follow-up orchestration (handle_reply or handle_initial_extraction). [SOW §10b]
       10. HITL routing — escalate when thresholds are breached.              [SOW §7 / §9b]
       11. Auto-approval → Brokerware shipment creation + confirmation reply.  [SOW §9a/10a/12]
       12. Email record persistence to PostgreSQL + blob log upload.           [SOW §11]
+
+    Args:
+        message_id:      Graph message ID to process.
+        mailbox_user_id: UPN/objectId of the mailbox that received the email.
+                         Falls back to Config.GRAPH_MAILBOX_USER_ID when None.
     """
     import asyncio
     import re
@@ -306,9 +381,16 @@ def _run_email_pipeline(message_id: str) -> None:
         graph_client = GraphClient(graph_cfg)
         access_token = get_app_token()
 
+        # Determine which mailbox to query — prefer the value from the queue
+        # envelope (supports multi-inbox), fall back to the single configured mailbox.
+        target_mailbox = mailbox_user_id or Config.GRAPH_MAILBOX_USER_ID
+        if not target_mailbox:
+            logger.error("No mailbox configured (GRAPH_MAILBOX_USER_ID / mailbox_user_id) — cannot fetch message")
+            return
+
         url = (
             f"https://graph.microsoft.com/v1.0"
-            f"/users/{Config.GRAPH_MAILBOX_USER_ID}/messages/{message_id}"
+            f"/users/{target_mailbox}/messages/{message_id}"
             f"?$select=id,conversationId,subject,body,from,toRecipients,"
             f"receivedDateTime,hasAttachments"
         )
@@ -744,7 +826,9 @@ def _create_and_confirm_shipment(
 # ---------------------------------------------------------------------------
 
 @app.timer_trigger(
-    schedule="%FOLLOWUP_TIMER_SCHEDULE%",   # set in Azure App Settings: "0 0 */24 * * *" for production (daily), "0 */5 * * * *" for testing
+    # Default: every 24 hours (production-safe).
+    # Override in Azure App Settings: e.g. "0 */5 * * * *" for 5-min testing cadence.
+    schedule=os.getenv("FOLLOWUP_TIMER_SCHEDULE", "0 0 */24 * * *"),
     arg_name="timer",
     run_on_startup=False,
     use_monitor=True,
@@ -882,7 +966,141 @@ def renew_subscriptions(timer: func.TimerRequest) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Trigger 5 — Admin: register webhook subscriptions (HTTP, function-level auth)
+# Trigger 5 — Timer: polling fallback (every 2 minutes)
+# ---------------------------------------------------------------------------
+
+@app.timer_trigger(
+    schedule=os.getenv("POLL_INBOX_SCHEDULE", "0 */2 * * * *"),
+    arg_name="timer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def poll_inbox_fallback(timer: func.TimerRequest) -> None:
+    """
+    Polling fallback: every 2 minutes, fetch new inbox messages from each
+    configured mailbox via Graph API and enqueue any that are not already
+    tracked by the webhook pipeline.
+
+    This guards against dropped webhook notifications or lapsed subscriptions
+    without duplicating messages that were already enqueued by the webhook
+    trigger (the shared `_is_already_processing()` dedup marker handles that).
+
+    Checkpoint: last-polled UTC timestamp is stored in blob
+    ``processed-logs/poll-checkpoint.json``.  On first run (no checkpoint)
+    the function looks back 10 minutes.
+    """
+    import asyncio
+    from datetime import timedelta
+
+    from src.config import Config
+
+    cfg      = Config
+    conn_str = cfg.AZURE_STORAGE_CONNECTION_STRING
+    queue_name = cfg.AZURE_STORAGE_QUEUE_NAME
+
+    if not conn_str:
+        logger.warning(
+            "poll_inbox_fallback: AZURE_STORAGE_CONNECTION_STRING not set — skipping"
+        )
+        return
+
+    from azure.storage.blob import BlobServiceClient
+    from azure.storage.queue import QueueClient
+
+    svc = BlobServiceClient.from_connection_string(conn_str)
+    checkpoint_blob = svc.get_blob_client(
+        container="processed-logs", blob="poll-checkpoint.json"
+    )
+
+    # ── Load checkpoint ────────────────────────────────────────────────────
+    try:
+        raw          = checkpoint_blob.download_blob().readall()
+        last_polled  = datetime.fromisoformat(json.loads(raw)["last_polled"])
+    except Exception:
+        # First run or checkpoint missing — look back 10 minutes
+        last_polled = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    now = datetime.now(timezone.utc)
+
+    # ── Obtain Graph app-only token ────────────────────────────────────────
+    try:
+        access_token = _get_app_token()
+    except Exception as exc:
+        logger.error("poll_inbox_fallback: could not get app token: %s", exc)
+        return
+
+    # ── Build Graph client ─────────────────────────────────────────────────
+    from src.models.graph_models import GraphConfig
+    from src.services.graph_client import GraphClient
+
+    graph_cfg = GraphConfig(
+        tenant_id=cfg.AZURE_AD_TENANT_ID or "",
+        client_id=cfg.AZURE_AD_CLIENT_ID or "",
+        client_secret=cfg.AZURE_AD_CLIENT_SECRET or "",
+        redirect_uri=cfg.GRAPH_REDIRECT_URI,
+    )
+    graph_client = GraphClient(graph_cfg)
+    queue_client = QueueClient.from_connection_string(conn_str, queue_name)
+
+    mailbox_ids = cfg.get_mailbox_user_ids()
+    if not mailbox_ids:
+        logger.warning("poll_inbox_fallback: no mailbox IDs configured — skipping")
+        return
+
+    total_enqueued = 0
+    for mailbox_user_id in mailbox_ids:
+        try:
+            messages = asyncio.run(
+                graph_client.get_new_messages(
+                    access_token=access_token,
+                    mailbox_user_id=mailbox_user_id,
+                    since=last_polled,
+                )
+            )
+            for mail in messages:
+                if not mail.id:
+                    continue
+                # Skip messages already tracked by webhook or a prior poll run
+                if _is_already_processing(mail.id):
+                    logger.debug(
+                        "poll_inbox_fallback: skip already-tracked message_id=%s", mail.id
+                    )
+                    continue
+                envelope = {
+                    "message_id":      mail.id,
+                    "mailbox_user_id": mailbox_user_id,
+                    "source":          "poll",
+                    "received_at":     datetime.now(timezone.utc).isoformat(),
+                }
+                queue_client.send_message(json.dumps(envelope))
+                total_enqueued += 1
+                logger.info(
+                    "poll_inbox_fallback: enqueued message_id=%s mailbox=%s",
+                    mail.id, mailbox_user_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "poll_inbox_fallback: error polling mailbox=%s: %s",
+                mailbox_user_id, exc, exc_info=True,
+            )
+
+    logger.info(
+        "poll_inbox_fallback: done — enqueued=%d new message(s) since %s",
+        total_enqueued, last_polled.isoformat(),
+    )
+
+    # ── Save updated checkpoint ────────────────────────────────────────────
+    try:
+        checkpoint_blob.upload_blob(
+            json.dumps({"last_polled": now.isoformat()}),
+            overwrite=True,
+        )
+    except Exception as exc:
+        logger.warning("poll_inbox_fallback: checkpoint save failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Trigger 6 — Admin: register webhook subscriptions (HTTP, function-level auth)
 # ---------------------------------------------------------------------------
 
 @app.route(route="register_webhooks", auth_level=func.AuthLevel.FUNCTION)
@@ -925,16 +1143,9 @@ def register_webhooks(req: func.HttpRequest) -> func.HttpResponse:
 
     cfg = _get_config()
 
-    user_id          = body.get("user_id")          or cfg.GRAPH_MAILBOX_USER_ID
     notification_url = body.get("notification_url") or cfg.GRAPH_WEBHOOK_NOTIFICATION_URL
     client_state     = body.get("client_state")     or cfg.GRAPH_WEBHOOK_CLIENT_STATE
 
-    if not user_id:
-        return func.HttpResponse(
-            json.dumps({"error": "user_id required (or set GRAPH_MAILBOX_USER_ID)"}),
-            status_code=400,
-            mimetype="application/json",
-        )
     if not notification_url:
         return func.HttpResponse(
             json.dumps({"error": "notification_url required (or set GRAPH_WEBHOOK_NOTIFICATION_URL)"}),
@@ -942,34 +1153,46 @@ def register_webhooks(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    mgr    = _get_subscription_manager()
-    sub_id = mgr.register(
-        resource=f"users/{user_id}/mailFolders/Inbox/messages",
-        change_types=["created"],
-        notification_url=notification_url,
-        client_state=client_state,
-    )
+    # Support a single user_id override from the request body, or register
+    # subscriptions for every mailbox in GRAPH_MAILBOX_USER_IDS / GRAPH_MAILBOX_USER_ID.
+    if body.get("user_id"):
+        mailbox_ids = [body["user_id"]]
+    else:
+        mailbox_ids = cfg.get_mailbox_user_ids()
 
-    if sub_id:
-        logger.info(
-            "Webhook registered: sub_id=%s user=%s url=%s",
-            sub_id, user_id, notification_url,
-        )
+    if not mailbox_ids:
         return func.HttpResponse(
-            json.dumps({"subscription_id": sub_id, "status": "registered"}),
-            status_code=200,
+            json.dumps({"error": "No mailbox IDs configured — set GRAPH_MAILBOX_USER_IDS or GRAPH_MAILBOX_USER_ID"}),
+            status_code=400,
             mimetype="application/json",
         )
 
+    mgr = _get_subscription_manager()
+    results: List[Dict[str, Any]] = []
+    for uid in mailbox_ids:
+        sub_id = mgr.register(
+            resource=f"users/{uid}/mailFolders/Inbox/messages",
+            change_types=["created"],
+            notification_url=notification_url,
+            client_state=client_state,
+        )
+        status = "registered" if sub_id else "failed"
+        results.append({"user_id": uid, "subscription_id": sub_id, "status": status})
+        if sub_id:
+            logger.info("Webhook registered: sub_id=%s user=%s url=%s", sub_id, uid, notification_url)
+        else:
+            logger.error("Webhook registration failed for user=%s — check logs", uid)
+
+    all_ok = all(r["subscription_id"] for r in results)
     return func.HttpResponse(
-        json.dumps({"error": "Failed to register subscription — check logs for details"}),
-        status_code=500,
+        json.dumps({"subscriptions": results}),
+        status_code=200 if all_ok else 207,   # 207 Multi-Status when some failed
         mimetype="application/json",
     )
 
 
 # ---------------------------------------------------------------------------
-# Trigger 6 — Health check endpoint for App Gateway / APIM probes
+# Trigger 7 — Health check endpoint for App Gateway / APIM probes
 # ---------------------------------------------------------------------------
 
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)

@@ -117,6 +117,14 @@ class ConversationState(BaseModel):
     )
     last_followup_at: Optional[str] = None
 
+    # ── Multi-tenant & multi-inbox identity ───────────────────────────────
+    tenant_id: Optional[str] = None
+    """Azure AD tenant ID scoping this conversation. None = single-tenant / legacy."""
+
+    mailbox_user_id: Optional[str] = None
+    """Graph mailbox UPN or object ID that received the original email.
+    Used for multi-inbox routing and blob path isolation."""
+
     class Config:
         populate_by_name = True
 
