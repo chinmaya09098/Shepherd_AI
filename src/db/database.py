@@ -127,7 +127,7 @@ def init_db() -> bool:
     try:
         Base.metadata.create_all(engine)
         _initialized = True
-        logger.info("PostgreSQL schema ensured (table: email_records)")
+        logger.info("PostgreSQL schema ensured (tables: email_records, customer_retry_config)")
         return True
     except Exception as e:
         logger.error(f"Failed to initialise PostgreSQL schema: {e}")
