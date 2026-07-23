@@ -96,6 +96,9 @@ class ReviewRequest(BaseModel):
     )
     reviewed_at:           Optional[str] = None
 
+    tenant_id:             Optional[str] = None
+    """Azure AD tenant ID scoping this review. None = single-tenant / legacy."""
+
     class Config:
         populate_by_name = True
 

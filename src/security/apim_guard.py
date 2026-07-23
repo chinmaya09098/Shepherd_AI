@@ -72,9 +72,23 @@ def require_apim_key(
     header_name  = Config.APIM_SUBSCRIPTION_KEY_HEADER
 
     if not expected_key:
-        # Key not configured yet — log a warning and allow the request so the
-        # app remains functional during initial deployment before the secret is
-        # populated in Key Vault.  Set APIM_SUBSCRIPTION_KEY to enforce.
+        # Key not configured yet.
+        # APIM_STRICT_ENFORCEMENT=true → reject all requests (hard block).
+        # APIM_STRICT_ENFORCEMENT=false (default) → warn and pass through so
+        # the app stays functional during initial deployment before the vault
+        # secret is populated.
+        from src.config import Config
+        if Config.APIM_STRICT_ENFORCEMENT:
+            logger.error(
+                "APIM_SUBSCRIPTION_KEY not configured — strict enforcement blocks all requests. "
+                "Store the key in Key Vault as 'apim-subscription-key'."
+            )
+            _emit_auth_rejection(req, reason="apim_key_not_configured")
+            return func.HttpResponse(
+                "Service Unavailable — security misconfiguration",
+                status_code=503,
+                mimetype="text/plain",
+            )
         logger.warning(
             "APIM_SUBSCRIPTION_KEY is not configured — all requests accepted. "
             "Store the key in Key Vault as 'apim-subscription-key' to enforce APIM routing."

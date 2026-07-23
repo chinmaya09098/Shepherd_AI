@@ -117,6 +117,36 @@ class Config:
     # endpoints (register_webhooks, etc.).  Example: "WebhookAdmin,ShipmentProcessor"
     RBAC_ADMIN_ROLES: str = os.getenv("RBAC_ADMIN_ROLES", "WebhookAdmin")
 
+    # Multi-inbox support: comma-separated mailbox UPNs/object IDs.
+    # Falls back to GRAPH_MAILBOX_USER_ID (single-inbox compat).
+    GRAPH_MAILBOX_USER_IDS: str = os.getenv("GRAPH_MAILBOX_USER_IDS", "")
+
+    # APIM: when True, a missing APIM_SUBSCRIPTION_KEY returns HTTP 503 instead
+    # of a warning + pass-through.  Safe default is False for initial deployment
+    # before the vault secret is populated.
+    APIM_STRICT_ENFORCEMENT: bool = os.getenv("APIM_STRICT_ENFORCEMENT", "false").lower() == "true"
+
+    # JWT audience for RS256 signature verification.
+    # Defaults to AZURE_AD_CLIENT_ID when not explicitly set.
+    AZURE_AD_AUDIENCE: Optional[str] = os.getenv("AZURE_AD_AUDIENCE")
+    # JWKS cache TTL in seconds (default 1 hour).
+    AZURE_AD_JWKS_CACHE_TTL: int = int(os.getenv("AZURE_AD_JWKS_CACHE_TTL", "3600"))
+
+    # PostgreSQL connection pool tuning
+    DB_POOL_SIZE: int    = int(os.getenv("DB_POOL_SIZE",    "5"))
+    DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+    DB_POOL_TIMEOUT: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+    DB_POOL_RECYCLE: int = int(os.getenv("DB_POOL_RECYCLE", "300"))  # recycle every 5 min
+
+    # Polling fallback timer schedule (Azure cron — every 2 min default).
+    # Override in App Settings: e.g. "0 */5 * * * *" for 5-min cadence.
+    POLL_INBOX_SCHEDULE: str = os.getenv("POLL_INBOX_SCHEDULE", "0 */2 * * * *")
+
+    # Tenant scope prefix for Azure Blob Storage paths.
+    # Leave blank (default) to keep legacy unscoped paths unchanged.
+    # Set to a short tenant name (e.g. "acme") when deploying multi-tenant.
+    TENANT_ID_SCOPE: str = os.getenv("TENANT_ID_SCOPE", "")
+
     # Input validation limits (can be tuned via env vars without redeploying)
     MAX_EMAIL_BODY_CHARS: int    = int(os.getenv("MAX_EMAIL_BODY_CHARS",    "500000"))
     MAX_ATTACHMENT_BYTES: int    = int(os.getenv("MAX_ATTACHMENT_BYTES",    "26214400"))  # 25 MB
@@ -160,6 +190,19 @@ class Config:
     EMAIL_EXAMPLES_DIR: str = os.getenv("EMAIL_EXAMPLES_DIR", "Load_Tender_Email_Examples")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "output")
     
+    @classmethod
+    def get_mailbox_user_ids(cls) -> list:
+        """Return the list of configured mailbox UPNs / object IDs.
+
+        Reads GRAPH_MAILBOX_USER_IDS (comma-separated) first; falls back to
+        the single GRAPH_MAILBOX_USER_ID for backward compatibility.
+        """
+        if cls.GRAPH_MAILBOX_USER_IDS:
+            return [uid.strip() for uid in cls.GRAPH_MAILBOX_USER_IDS.split(",") if uid.strip()]
+        if cls.GRAPH_MAILBOX_USER_ID:
+            return [cls.GRAPH_MAILBOX_USER_ID]
+        return []
+
     @classmethod
     def validate(cls) -> bool:
         """Validate that required configuration is present"""

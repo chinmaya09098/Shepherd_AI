@@ -2,9 +2,14 @@
 Human-in-the-Loop (HITL) review queue — persistence layer.
 
 Storage mirrors ConversationTracker:
-  Primary  : Azure Blob Storage  (review-queue/<review_id>.json)
+  Primary  : Azure Blob Storage  ({scope}/review-queue/<review_id>.json)
   Fallback : Local JSON files    (OUTPUT_DIR/review_queue/<review_id>.json)
   Cache    : Module-level dict   (survives Streamlit reruns in one process)
+
+Blob path scoping:
+  When TENANT_ID_SCOPE is set (or req.tenant_id is non-None), blobs are
+  stored under "{scope}/review-queue/".  An empty scope uses the legacy
+  unscoped path "review-queue/" for backward compatibility.
 """
 from __future__ import annotations
 
@@ -17,11 +22,22 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_BLOB_PREFIX = "review-queue/"
 _LOCAL_DIR = (
     Path(Config.OUTPUT_DIR if hasattr(Config, "OUTPUT_DIR") else "output")
     / "review_queue"
 )
+
+
+def _review_blob_prefix(tenant_id: Optional[str] = None) -> str:
+    """Return the blob path prefix for review queue, optionally scoped to a tenant.
+
+    An empty scope (default) uses the legacy unscoped "review-queue/" path so
+    existing blobs are unaffected when TENANT_ID_SCOPE is first introduced.
+    """
+    scope = tenant_id or Config.TENANT_ID_SCOPE
+    if scope:
+        return f"{scope}/review-queue/"
+    return "review-queue/"
 
 
 class ReviewQueue:
@@ -44,7 +60,7 @@ class ReviewQueue:
         """
         self._cache[req.review_id] = req
 
-        blob_client = self._get_blob_client(req.review_id)
+        blob_client = self._get_blob_client(req.review_id, tenant_id=req.tenant_id)
         if blob_client:
             try:
                 blob_client.upload_blob(req.model_dump_json(indent=2), overwrite=True)
@@ -73,19 +89,23 @@ class ReviewQueue:
     # ── Read ──────────────────────────────────────────────────────────────────
 
     def load(self, review_id: str) -> Optional[ReviewRequest]:
-        """Load a ReviewRequest by ID. Checks cache → blob → local disk."""
+        """Load a ReviewRequest by ID. Checks cache → blob (scoped then legacy) → local disk."""
         if review_id in self._cache:
             return self._cache[review_id]
 
-        blob_client = self._get_blob_client(review_id)
-        if blob_client:
-            try:
-                data = blob_client.download_blob().readall()
-                req  = ReviewRequest.model_validate_json(data)
-                self._cache[review_id] = req
-                return req
-            except Exception:
-                pass
+        # Try scoped path then legacy unscoped path (backward compat)
+        for tenant_scope in [None, ""]:
+            blob_client = self._get_blob_client(review_id, tenant_id=tenant_scope)
+            if blob_client:
+                try:
+                    data = blob_client.download_blob().readall()
+                    req  = ReviewRequest.model_validate_json(data)
+                    self._cache[review_id] = req
+                    return req
+                except Exception:
+                    pass
+            if not Config.TENANT_ID_SCOPE:
+                break   # scoped == legacy when scope is empty; no need to try twice
 
         path = _LOCAL_DIR / f"{review_id}.json"
         if path.exists():
@@ -182,7 +202,14 @@ class ReviewQueue:
         return all_reviews
 
     @staticmethod
-    def _get_blob_client(review_id: str):
+    def _get_blob_client(review_id: str, tenant_id: Optional[str] = None):
+        """Return a BlobClient for the review queue blob.
+
+        Args:
+            review_id:  Unique review ID (used as filename).
+            tenant_id:  Override tenant scope. None → Config.TENANT_ID_SCOPE;
+                        "" → force legacy unscoped path.
+        """
         if not Config.AZURE_STORAGE_CONNECTION_STRING:
             return None
         try:
@@ -191,7 +218,7 @@ class ReviewQueue:
                 Config.AZURE_STORAGE_CONNECTION_STRING
             )
             container = Config.AZURE_STORAGE_LOGS_CONTAINER or "processed-logs"
-            blob_name = f"{_BLOB_PREFIX}{review_id}.json"
+            blob_name = f"{_review_blob_prefix(tenant_id)}{review_id}.json"
             return service.get_blob_client(container=container, blob=blob_name)
         except Exception as exc:
             logger.debug("Could not create review blob client: %s", exc)

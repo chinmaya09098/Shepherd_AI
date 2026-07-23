@@ -24,11 +24,10 @@ from src.extractors.content_understanding import ContentUnderstandingExtractor
 from src.extractors.openai_agent import OpenAIAgent
 from src.models.shipment import Shipment, LocationInfo, ShipmentAddress
 from src.models.client_format import format_client_json_str
-from src.services.hyperion_client import resolve_customer_id
-# Customer matching now uses Brokerware's CustomerContactsSummary (replaces the
+# Customer matching uses Brokerware's CustomerContactsSummary (replaces the
 # Hyperion + Azure AI Search vector-search path). Aliased so call sites are unchanged.
 from src.services.brokerware_client import match_customer as find_customer_matches
-from src.db.email_repository import record_email
+from src.db.email_repository import record_email, update_email_class, derive_class
 from src.utils.blob_log_handler import BlobLogHandler
 from src.utils.logger import get_logger
 from src.ui.styles import get_light_theme_css
@@ -160,12 +159,20 @@ def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None)
     """
     Submit a fully-extracted shipment to Brokerware TMS CreateShipmentAPI.
     Shows success/error feedback in the Streamlit UI.
-    Only runs when Brokerware credentials are configured.
+    Only runs when Brokerware credentials are configured and customer is resolved.
     """
     if not brokerware_is_configured():
         return
 
     if shipment.email_type not in ("shipment_tender", "shipment_quote"):
+        return
+
+    if not customer_id:
+        st.warning(
+            "Brokerware submission skipped — sender not found in Brokerware contacts. "
+            "Ask your Brokerware admin to add this contact, then reprocess."
+        )
+        logger.warning("Brokerware submission skipped: customer_id is None")
         return
 
     with st.spinner("Creating shipment in Brokerware TMS..."):
@@ -279,7 +286,25 @@ def process_email_file(uploaded_file) -> List[Shipment]:
             email_data = eml_parser.parse(tmp_path)
             st.success(f"Email parsed: {email_data['subject']}")
             st.info(f"Found {len(email_data['attachments'])} attachments")
-        
+
+        # Resolve customer ID via Brokerware once before processing attachments
+        with st.spinner("Resolving customer ID..."):
+            try:
+                _cr = find_customer_matches(
+                    email_data.get('from', ''), email_data.get('to', '')
+                )
+                _cr_matches = _cr.get("matches", [])
+                resolved_cid: Optional[int] = (
+                    _cr_matches[0].get("customerId") if _cr_matches else None
+                )
+                if resolved_cid:
+                    st.info(f"Customer resolved: ID {resolved_cid}")
+                else:
+                    st.info("No matching customer found in Brokerware contacts")
+            except Exception as _e:
+                logger.warning("Customer ID resolution failed: %s", _e)
+                resolved_cid = None
+
         # Process attachments if any, otherwise process email body
         if len(email_data['attachments']) > 0:
             _image_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp', '.ico'}
@@ -339,15 +364,14 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                         'sender_email': email_data.get('from', ''),
                     })
                     if not shipment.missing_required_fields:
-                        cid = resolve_customer_id(email_data.get('from', ''))
                         _save_shipment_json_to_blob(
                             shipment,
                             email_name=uploaded_file.name,
                             source_name=attachment['filename'],
                             index=idx,
-                            customer_id=cid,
+                            customer_id=resolved_cid,
                         )
-                        _submit_to_brokerware(shipment, customer_id=cid)
+                        _submit_to_brokerware(shipment, customer_id=resolved_cid)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -373,15 +397,14 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                     'sender_email': email_data.get('from', ''),
                 })
                 if not shipment.missing_required_fields:
-                    cid = resolve_customer_id(email_data.get('from', ''))
                     _save_shipment_json_to_blob(
                         shipment,
                         email_name=uploaded_file.name,
                         source_name='Email Body',
                         index=1,
-                        customer_id=cid,
+                        customer_id=resolved_cid,
                     )
-                    _submit_to_brokerware(shipment, customer_id=cid)
+                    _submit_to_brokerware(shipment, customer_id=resolved_cid)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
@@ -697,18 +720,41 @@ def _store_email_record(email_data: dict, shipments: List[dict], customer_id: Op
     """
     Persist one row in PostgreSQL for the inbound email just processed.
 
+    Phase 1 (upsert_inbox_email) already inserts a 'pending' row when the inbox
+    loads. Phase 2 (here) should UPDATE that row with the resolved class, client_id,
+    and status. Falls back to INSERT only if no row exists yet (e.g. webhook path).
+
     The 'Class' (SM/CM/AI) is derived from the per-attachment email types so
     shipment-bearing mail is tagged 'SM' and everything else 'CM'. Failures are
-    swallowed inside record_email() — this never blocks extraction.
+    swallowed — this never blocks extraction.
     """
     try:
         llm_email_types = [s["shipment"].email_type for s in (shipments or [])]
+        message_id = (
+            email_data.get("message_id")
+            or email_data.get("internet_message_id")
+        )
+        class_code = derive_class("Inbound", llm_email_types)
+        extra = {"shipment_count": len(shipments or [])}
+
+        # Try UPDATE first (row already exists from Phase 1 inbox load)
+        if message_id:
+            updated = update_email_class(
+                message_id,
+                class_code=class_code,
+                client_id=customer_id,
+                extra_metadata=extra,
+            )
+            if updated:
+                return  # Row patched — done
+
+        # No existing row — INSERT (webhook or first-time processing)
         record_email(
             email_data,
             direction="Inbound",
             client_id=customer_id,
             llm_email_types=llm_email_types,
-            extra_metadata={"shipment_count": len(shipments or [])},
+            extra_metadata=extra,
         )
     except Exception as e:
         logger.error(f"Failed to store email record: {e}")

@@ -39,3 +39,6 @@ azure-monitor-opentelemetry>=1.2.0
 
 # Azure Storage Queue (used by webhook → queue pipeline)
 azure-storage-queue>=12.9.0
+
+# JWT signature verification against Azure AD JWKS (RS256)
+PyJWT>=2.8.0

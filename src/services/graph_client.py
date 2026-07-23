@@ -418,6 +418,62 @@ class GraphClient:
         return all_messages
 
     # -------------------------------------------------------------------------
+    # App-only inbox polling — used by the polling-fallback timer trigger
+    # -------------------------------------------------------------------------
+
+    async def get_new_messages(
+        self,
+        access_token: str,
+        mailbox_user_id: str,
+        since: datetime,
+        top: int = 100,
+    ) -> List[MailMessage]:
+        """
+        Fetch inbox messages received after *since* for a specific mailbox using
+        app-only (client credentials) authentication.
+
+        Unlike ``get_mails_from_folder()``, this method addresses a specific user
+        mailbox via the ``/users/{user_id}/...`` Graph endpoint rather than
+        ``/me/...``, making it suitable for daemon / app-only flows.
+
+        Used by the ``poll_inbox_fallback`` timer trigger as a resilience layer
+        when webhook notifications may have been dropped.
+
+        Args:
+            access_token:    App-only bearer token from ``get_app_token()``.
+            mailbox_user_id: UPN or object ID of the target mailbox
+                             (e.g. "inbox@company.com" or an Azure AD objectId GUID).
+            since:           Only return messages received after this UTC datetime.
+            top:             Maximum messages to return per call (default 100).
+
+        Returns:
+            List of MailMessage objects ordered oldest-first, or [] on error.
+        """
+        since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (
+            f"{GRAPH_BASE_URL}/users/{mailbox_user_id}/mailFolders/Inbox/messages"
+            f"?$filter=receivedDateTime ge {since_str}"
+            f"&$select=id,conversationId,subject,from,toRecipients,receivedDateTime,hasAttachments"
+            f"&$orderby=receivedDateTime asc"
+            f"&$top={top}"
+        )
+        try:
+            raw  = await self._web_api_get(url, access_token)
+            data = json.loads(raw)
+            messages = [self._parse_mail_message(m) for m in data.get("value", [])]
+            logger.info(
+                "poll: fetched %d message(s) for mailbox=%s since=%s",
+                len(messages), mailbox_user_id, since_str,
+            )
+            return messages
+        except Exception as exc:
+            logger.warning(
+                "get_new_messages failed for mailbox=%s since=%s: %s",
+                mailbox_user_id, since_str, exc,
+            )
+            return []
+
+    # -------------------------------------------------------------------------
     # High-level inbox reader — replaces Service.cs ReadFromOutlookInbox()
     # -------------------------------------------------------------------------
 
