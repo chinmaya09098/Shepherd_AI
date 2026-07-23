@@ -87,3 +87,46 @@ class EmailRecord(Base):
             f"<EmailRecord id={self.id} class={self.class_code} "
             f"type={self.email_type} subject={self.mail_subject!r}>"
         )
+
+
+class CustomerRetryConfig(Base):
+    """
+    Per-customer configuration for how many follow-up reminder emails to send
+    before escalating to human review.
+
+    Rows are seeded from the Brokerware CustomerContactsSummary endpoint
+    (ClientId + CustomerId come directly from that API). The retry_count
+    column is the only value an admin needs to edit manually.
+
+    Schema mirrors the requested table layout:
+        ClientId  | Domain                  | CustomerId | RetryCount
+        ----------|-------------------------|------------|------------
+        4097939   | shepherd.brokerware.io  | 4097986    | 3
+        239871    | apples.brokerware.io    | 279189     | 5
+    """
+    __tablename__ = "customer_retry_config"
+
+    # Primary key — Brokerware's customerId uniquely identifies a customer.
+    customer_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    # Brokerware clientId (from CustomerContactsSummary).
+    client_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+
+    # Brokerware subdomain (e.g. "shepherd.brokerware.io").
+    # Derived from BROKERWARE_BASE_URL; stored for visibility / multi-tenant use.
+    domain: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+
+    # Maximum number of follow-up reminder emails to send for this customer
+    # before the conversation is escalated to HITL review.
+    # Defaults to Config.FOLLOWUP_DEFAULT_MAX when not explicitly set.
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<CustomerRetryConfig customer_id={self.customer_id} "
+            f"client_id={self.client_id} domain={self.domain!r} retry_count={self.retry_count}>"
+        )

@@ -1297,10 +1297,24 @@ def _render_graph_tab():
                 try:
                     token = run_async(client.exchange_code_for_tokens(auth_code))
                     user_profile = run_async(client.get_user_profile(token.access_token))
+                    if user_profile is None:
+                        st.error(
+                            "Sign-in token was obtained but your user profile could not be "
+                            "fetched from Microsoft Graph (/me). Check that:\n"
+                            "1. The Azure App Registration has **User.Read** delegated permission with admin consent.\n"
+                            "2. The deployed server has outbound HTTPS access to graph.microsoft.com.\n"
+                            "3. **GRAPH_REDIRECT_URI** matches the URI registered in Azure."
+                        )
+                        logger.error(
+                            "get_user_profile returned None — User.Read scope may be missing "
+                            "or graph.microsoft.com is unreachable from the deployed server."
+                        )
+                        st.query_params.clear()
+                        return
                     st.session_state.graph_token = token
                     st.session_state.graph_connected = True
                     st.session_state.graph_user = (
-                        user_profile.user_principal_name if user_profile else "Unknown"
+                        user_profile.user_principal_name or user_profile.id or "Unknown"
                     )
                     st.query_params.clear()
                     st.rerun()

@@ -152,9 +152,8 @@ class Config:
     MAX_ATTACHMENT_BYTES: int    = int(os.getenv("MAX_ATTACHMENT_BYTES",    "26214400"))  # 25 MB
 
     # Follow-up reminder settings
-    # FOLLOWUP_MAX_BY_CUSTOMER: JSON mapping of customer_id (str) → max follow-ups (int)
-    #   Supported values: 3, 5, or 7  (e.g. '{"101": 5, "202": 7}')
-    #   Any customer not listed falls back to FOLLOWUP_DEFAULT_MAX.
+    # FOLLOWUP_MAX_BY_CUSTOMER: legacy JSON override (still supported as a fallback).
+    #   Example: '{"101": 5, "202": 7}'  — superseded by the customer_retry_config table.
     FOLLOWUP_MAX_BY_CUSTOMER: str = os.getenv("FOLLOWUP_MAX_BY_CUSTOMER", "{}")
     FOLLOWUP_DEFAULT_MAX: int = int(os.getenv("FOLLOWUP_DEFAULT_MAX", "3"))
     # How often the timer trigger re-sends reminder follow-ups.
@@ -165,20 +164,42 @@ class Config:
     def get_max_followups(cls, customer_id: Optional[int]) -> int:
         """Return the configured max follow-up count for a given customer_id.
 
-        Looks up FOLLOWUP_MAX_BY_CUSTOMER (a JSON dict keyed by customer_id as
-        a string). Falls back to FOLLOWUP_DEFAULT_MAX (default 3) when the
-        customer is not listed.  Supported per-customer values: 3, 5, or 7.
+        Lookup order:
+          1. customer_retry_config table in PostgreSQL  (set via Brokerware sync /
+             admin edit — this is the primary source of truth)
+          2. FOLLOWUP_MAX_BY_CUSTOMER env-var JSON dict  (legacy override)
+          3. FOLLOWUP_DEFAULT_MAX  (default 3)
         """
         import json as _json
-        if customer_id is None:
-            return cls.FOLLOWUP_DEFAULT_MAX
+
+        # 1. DB lookup — primary source (customer_retry_config table)
         try:
-            mapping = _json.loads(cls.FOLLOWUP_MAX_BY_CUSTOMER or "{}")
-            val = mapping.get(str(customer_id))
-            if val is not None:
-                return int(val)
+            from src.db.retry_config_repository import get_retry_count
+            db_val = get_retry_count(customer_id)
+            # get_retry_count returns FOLLOWUP_DEFAULT_MAX on miss, so only trust
+            # a DB row if the table actually has the customer_id.
+            if customer_id is not None:
+                from src.db.database import get_session, init_db
+                from src.db.models import CustomerRetryConfig
+                if init_db():
+                    with get_session() as _s:
+                        row = _s.get(CustomerRetryConfig, int(customer_id))
+                        if row is not None:
+                            return row.retry_count
         except Exception:
-            pass
+            pass  # DB unavailable — fall through to env var
+
+        # 2. Legacy env-var JSON dict
+        if customer_id is not None:
+            try:
+                mapping = _json.loads(cls.FOLLOWUP_MAX_BY_CUSTOMER or "{}")
+                val = mapping.get(str(customer_id))
+                if val is not None:
+                    return int(val)
+            except Exception:
+                pass
+
+        # 3. Global default
         return cls.FOLLOWUP_DEFAULT_MAX
 
     # Azure AI Search — separate index for RAG context retrieval
