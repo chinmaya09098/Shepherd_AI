@@ -324,7 +324,7 @@ def match_customer(sender_email: str, receiver_email: str = "") -> dict:
         if result:
             matches, confident = result
             logger.info(
-                "Brokerware customer match for '%s' → customerId=%s (%s)",
+                "Brokerware customer match for '%s' -> customerId=%s (%s)",
                 email, matches[0]["customerId"],
                 "confident" if confident else "ambiguous",
             )

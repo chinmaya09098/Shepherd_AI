@@ -168,6 +168,19 @@ def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None)
     if shipment.email_type not in ("shipment_tender", "shipment_quote"):
         return
 
+    # Brokerware requires a customerId to create a shipment. When the sender
+    # couldn't be matched to a customer (e.g. broker-forwarded email whose sender
+    # isn't in the contact list), skip creation and surface a clear message
+    # instead of a raw HTTP 400 — a wrong/blank customer is worse than none.
+    if not customer_id:
+        st.warning(
+            "Customer not resolved for this email — shipment **not** created in "
+            "Brokerware. The sender isn't a known customer contact; assign the "
+            "customer manually or follow up before creating the shipment."
+        )
+        logger.info("Skipping Brokerware create — no customerId resolved")
+        return
+
     with st.spinner("Creating shipment in Brokerware TMS..."):
         result = brokerware_create_shipment(shipment, customer_id=customer_id)
 
@@ -707,6 +720,7 @@ def _store_email_record(email_data: dict, shipments: List[dict], customer_id: Op
             email_data,
             direction="Inbound",
             client_id=customer_id,
+            customer_id=customer_id,
             llm_email_types=llm_email_types,
             extra_metadata={"shipment_count": len(shipments or [])},
         )

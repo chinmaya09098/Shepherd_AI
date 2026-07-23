@@ -20,8 +20,10 @@ class EmailRecord(Base):
 
     Field notes:
       - id                : UUID primary key (generated app-side).
-      - client_id         : the resolved Hyperion customerId for the email, as text
+      - client_id         : the resolved customerId for the email, as text
                             (nullable — not every email resolves to a client).
+      - customer_id       : the resolved Brokerware customerId as an integer — the
+                            value used to create the shipment (nullable).
       - conversation_id   : Graph/Outlook thread key that groups related messages.
                             Empty for .eml files (no thread context).
       - message_id        : unique per-message id (Graph message id, falls back to
@@ -48,6 +50,8 @@ class EmailRecord(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     client_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    # Resolved Brokerware customerId (the value used to create the shipment).
+    customer_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
     conversation_id: Mapped[Optional[str]] = mapped_column(String(512), index=True, nullable=True)
     message_id: Mapped[Optional[str]] = mapped_column(String(512), index=True, nullable=True)
 
