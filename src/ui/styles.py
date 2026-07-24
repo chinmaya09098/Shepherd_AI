@@ -75,8 +75,50 @@ def get_light_theme_css() -> str:
     [data-testid="stSelectbox"] {
         color: #111111 !important;
     }
-    
+
     [data-testid="stSelectbox"] > div > div {
+        background-color: #ffffff !important;
+    }
+
+    /* Selectbox dropdown popup (BaseWeb popover) */
+    [data-baseweb="popover"],
+    [data-baseweb="popover"] * {
+        background-color: #ffffff !important;
+        color: #111111 !important;
+    }
+
+    /* Selectbox dropdown menu list */
+    [data-baseweb="menu"],
+    [data-baseweb="menu"] ul,
+    [data-baseweb="menu"] li {
+        background-color: #ffffff !important;
+        color: #111111 !important;
+    }
+
+    /* Each dropdown option — normal state */
+    [role="option"] {
+        background-color: #ffffff !important;
+        color: #111111 !important;
+    }
+
+    /* Dropdown option — hover state */
+    [role="option"]:hover,
+    [data-baseweb="menu"] li:hover {
+        background-color: #e8f0fe !important;
+        color: #111111 !important;
+    }
+
+    /* Dropdown option — selected/highlighted state */
+    [role="option"][aria-selected="true"],
+    [data-baseweb="menu"] li[aria-selected="true"] {
+        background-color: #cce0ff !important;
+        color: #111111 !important;
+    }
+
+    /* Selectbox selected value display text */
+    [data-testid="stSelectbox"] [data-baseweb="select"] div,
+    [data-testid="stSelectbox"] [data-baseweb="select"] span {
+        color: #111111 !important;
         background-color: #ffffff !important;
     }
     
