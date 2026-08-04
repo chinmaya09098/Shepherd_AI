@@ -49,11 +49,18 @@ class Config:
     HYPERION_CLIENT_ID: Optional[str] = os.getenv("HYPERION_CLIENT_ID")
     HYPERION_CLIENT_SECRET: Optional[str] = os.getenv("HYPERION_CLIENT_SECRET")
 
-    # Brokerware TMS API
+    # Brokerware TMS API — default/fallback credentials (single-tenant legacy)
     BROKERWARE_BASE_URL: str = os.getenv("BROKERWARE_BASE_URL", "https://shepherd.brokerware.io")
     BROKERWARE_CLIENT_ID: Optional[str] = os.getenv("BROKERWARE_CLIENT_ID")
     BROKERWARE_CLIENT_SECRET: Optional[str] = os.getenv("BROKERWARE_CLIENT_SECRET")
-    BROKERWARE_DEFAULT_CUSTOMER_ID: int = int(os.getenv("BROKERWARE_DEFAULT_CUSTOMER_ID", "0"))
+
+    # Multi-tenant Brokerware routing: JSON map of lowercase mailbox UPN → tenant key.
+    # Tenant key must match the BROKERWARE_<KEY>_* env var prefix (e.g. "shepherd",
+    # "shepherdwest"). Example:
+    #   {"shepherd@ad.3plsystems.com": "shepherd",
+    #    "shepherd1@3plsystems0.onmicrosoft.com": "shepherd",
+    #    "shepherd2@3plsystems0.onmicrosoft.com": "shepherdwest"}
+    BROKERWARE_MAILBOX_TENANT_MAP: str = os.getenv("BROKERWARE_MAILBOX_TENANT_MAP", "{}")
 
     # Azure AI Search
     AZURE_SEARCH_ENDPOINT: Optional[str] = os.getenv("AZURE_SEARCH_ENDPOINT")

@@ -546,7 +546,8 @@ def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) 
             if mail_message.from_ and mail_message.from_.email_address:
                 sender_email_addr = mail_message.from_.email_address.address or ""
 
-            match_result = find_customer_matches(sender_email_addr, receiver_email)
+            match_result = find_customer_matches(sender_email_addr, receiver_email,
+                                                   mailbox_upn=target_mailbox or "")
             matches      = match_result.get("matches", [])
             is_broker    = match_result.get("is_broker_match", False)
 
@@ -626,6 +627,7 @@ def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) 
                 customer_id=customer_id,
                 graph_client=graph_client,
                 access_token=access_token,
+                mailbox_upn=target_mailbox or "",
             )
             pipeline_stage = "shipment_created"
 
@@ -746,6 +748,7 @@ def _create_and_confirm_shipment(
     customer_id: Optional[int],
     graph_client,
     access_token: str,
+    mailbox_upn: str = "",
 ) -> None:
     """
     Submit the finalised shipment to Brokerware TMS and send a confirmation reply.
@@ -763,17 +766,22 @@ def _create_and_confirm_shipment(
         access_token: Valid Graph API bearer token.
     """
     import asyncio
-    from src.services.brokerware_client import create_shipment, is_configured as brokerware_configured
+    from src.services.brokerware_client import (
+        create_shipment,
+        is_configured as brokerware_configured,
+    )
     from src.services.followup_email_generator import FollowupEmailGenerator
 
-    if not brokerware_configured():
+    if not brokerware_configured(mailbox_upn):
         logger.warning(
-            "_create_and_confirm_shipment: Brokerware credentials not configured — skipping"
+            "_create_and_confirm_shipment: Brokerware credentials not configured "
+            "for mailbox=%s — skipping", mailbox_upn or "default"
         )
         return
 
     # [SOW §10a / §12] Format manifest and submit to Brokerware → ShipMind
-    creation_result = create_shipment(shipment, customer_id=customer_id)
+    creation_result = create_shipment(shipment, customer_id=customer_id,
+                                      mailbox_upn=mailbox_upn)
 
     if creation_result.success:
         load_id = creation_result.shipment_id or "N/A"
