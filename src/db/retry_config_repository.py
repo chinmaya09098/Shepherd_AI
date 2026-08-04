@@ -116,48 +116,135 @@ def upsert_retry_configs(rows: List[dict]) -> int:
         return 0
 
 
-def sync_from_brokerware(default_retry_count: Optional[int] = None) -> int:
-    """Fetch CustomerContactsSummary from Brokerware and seed customer_retry_config.
+def ensure_customer_exists(
+    customer_id: int,
+    client_id: Optional[int],
+    domain: str,
+) -> bool:
+    """Insert a row for *customer_id* only if it does not already exist.
 
-    For each unique (clientId, customerId) pair returned by the API a row is
-    upserted.  Existing rows where an admin has already edited retry_count are
-    NOT overwritten (see upsert_retry_configs).
+    Uses INSERT … ON CONFLICT DO NOTHING so existing rows (including any
+    admin-edited retry_count) are never touched.  This is the hot-path
+    companion to sync_from_brokerware() — called on every successful email
+    match so new customers are auto-seeded without a manual sync.
+
+    Returns True if the row was inserted (new customer), False if it already
+    existed or if the DB is unavailable.
+    """
+    if not init_db():
+        return False
+
+    default_retries = Config.FOLLOWUP_DEFAULT_MAX
+    try:
+        with get_session() as session:
+            stmt = pg_insert(CustomerRetryConfig).values([{
+                "customer_id": int(customer_id),
+                "client_id":   client_id,
+                "domain":      domain,
+                "retry_count": default_retries,
+            }]).on_conflict_do_nothing(index_elements=["customer_id"])
+            result = session.execute(stmt)
+            session.commit()
+            inserted = bool(result.rowcount)
+            if inserted:
+                logger.info(
+                    "ensure_customer_exists: auto-seeded customer_id=%s domain=%s",
+                    customer_id, domain,
+                )
+            return inserted
+    except Exception as exc:
+        logger.warning(
+            "ensure_customer_exists: DB error for customer_id=%s — %s",
+            customer_id, exc,
+        )
+        return False
+
+
+def sync_from_brokerware(default_retry_count: Optional[int] = None) -> int:
+    """Fetch CustomerContactsSummary from every configured Brokerware tenant and
+    seed customer_retry_config.
+
+    Iterates over all unique tenant keys in BROKERWARE_MAILBOX_TENANT_MAP and
+    calls CustomerContactsSummary once per tenant.  Falls back to the default
+    tenant when the map is empty.  Existing rows where an admin has already
+    edited retry_count are NOT overwritten (see upsert_retry_configs).
+
+    This covers the multi-tenant case described by Jack:
+      - Shepherd tenant  (shepherd@3pl, shepherd1@3pl)  → shepherd.brokerware.io
+      - Shepherd West    (shepherd2@3pl)                 → shepherdwest.brokerware.io
+    Each tenant's contacts are stored with their own domain and customerIds.
+    Since Brokerware assigns different customerIds per tenant, there is no
+    collision even when the same email (e.g. dan@amazon) exists in both.
 
     Args:
         default_retry_count: Override the default retry count for new rows.
                              Defaults to Config.FOLLOWUP_DEFAULT_MAX.
 
-    Returns the number of rows upserted (0 on error or empty API response).
+    Returns the total number of rows upserted across all tenants.
     """
-    from src.services.brokerware_client import get_customer_contacts
+    import json as _json
+    from src.services.brokerware_client import get_customer_contacts, _load_tenant
 
     default = default_retry_count if default_retry_count is not None else Config.FOLLOWUP_DEFAULT_MAX
-    domain  = _brokerware_domain()
 
-    contacts = get_customer_contacts()
-    if not contacts:
-        logger.warning("sync_from_brokerware: no contacts returned from Brokerware API")
+    # Build one representative mailbox UPN per unique tenant key so we can
+    # call get_customer_contacts with the right credentials for each tenant.
+    try:
+        tenant_map: dict = _json.loads(Config.BROKERWARE_MAILBOX_TENANT_MAP or "{}")
+    except Exception:
+        tenant_map = {}
+
+    # {tenant_key: first_upn_for_that_key}  — one UPN per tenant is enough
+    key_to_upn: dict = {}
+    for upn, key in tenant_map.items():
+        if key not in key_to_upn:
+            key_to_upn[key] = upn
+
+    # If no tenant map configured, fall back to the default/legacy single tenant
+    upns_to_sync: List[str] = list(key_to_upn.values()) or [""]
+
+    all_rows: List[dict] = []
+    seen_customer_ids: set = set()
+
+    for upn in upns_to_sync:
+        tenant = _load_tenant(upn)
+        raw_url = tenant.base_url or ""
+        parsed  = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+        domain  = parsed.hostname or raw_url
+
+        contacts = get_customer_contacts(mailbox_upn=upn)
+        if not contacts:
+            logger.warning(
+                "sync_from_brokerware: no contacts returned for tenant=%s (upn=%s)",
+                tenant.key, upn or "(default)",
+            )
+            continue
+
+        for c in contacts:
+            cust_id   = c.get("customerId")
+            client_id = c.get("clientId")
+            if cust_id is None or cust_id in seen_customer_ids:
+                continue
+            seen_customer_ids.add(cust_id)
+            all_rows.append({
+                "customer_id": int(cust_id),
+                "client_id":   int(client_id) if client_id is not None else None,
+                "domain":      domain,
+                "retry_count": default,
+            })
+
+        logger.info(
+            "sync_from_brokerware: tenant=%s fetched %d contact(s) from %s",
+            tenant.key, len(contacts), domain,
+        )
+
+    if not all_rows:
+        logger.warning("sync_from_brokerware: no contacts found across any configured tenant")
         return 0
 
-    # De-duplicate by customerId (multiple emails can share one customerId)
-    seen: set = set()
-    rows: List[dict] = []
-    for c in contacts:
-        cust_id   = c.get("customerId")
-        client_id = c.get("clientId")
-        if cust_id is None or cust_id in seen:
-            continue
-        seen.add(cust_id)
-        rows.append({
-            "customer_id": int(cust_id),
-            "client_id":   int(client_id) if client_id is not None else None,
-            "domain":      domain,
-            "retry_count": default,
-        })
-
     logger.info(
-        "sync_from_brokerware: %d unique customer(s) found in Brokerware contacts "
-        "(domain=%s, default_retry=%d)",
-        len(rows), domain, default,
+        "sync_from_brokerware: %d unique customer(s) total across %d tenant(s) "
+        "(default_retry=%d)",
+        len(all_rows), len(upns_to_sync), default,
     )
-    return upsert_retry_configs(rows)
+    return upsert_retry_configs(all_rows)

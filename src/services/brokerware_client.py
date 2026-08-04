@@ -134,6 +134,12 @@ def _get_token(tenant: _BrokerwareTenant) -> str:
 # CreateShipment
 # ---------------------------------------------------------------------------
 
+# HTTP status codes that indicate a transient Brokerware-side error worth retrying.
+_RETRYABLE_HTTP_STATUS = {500, 502, 503, 504}
+# Delay in seconds before each successive attempt (index 0 = first attempt, no delay).
+_RETRY_BACKOFF = [0, 2, 5]
+
+
 def create_shipment(
     shipment: Shipment,
     customer_id: Optional[int] = None,
@@ -141,6 +147,10 @@ def create_shipment(
 ) -> CreateShipmentResult:
     """
     Submit a shipment to Brokerware TMS via the CreateShipmentAPI endpoint.
+
+    Retries automatically on transient HTTP 5xx errors and network timeouts
+    (up to 3 attempts with 2 s / 5 s backoff).  HTTP 4xx errors (bad payload,
+    auth) are returned immediately without retrying.
 
     Args:
         shipment:    Extracted Shipment model (from OpenAI agent).
@@ -154,6 +164,7 @@ def create_shipment(
 
     payload = format_client_json(shipment, customer_id=customer_id)
     url = f"{tenant.base_url}/api/clientv1/CreateShipmentAPI"
+    max_attempts = len(_RETRY_BACKOFF)
 
     logger.info(
         "Creating Brokerware shipment tenant=%s customerId=%s "
@@ -162,52 +173,80 @@ def create_shipment(
         payload.get("shipperZip"), payload.get("consigneeZip"),
     )
 
-    try:
-        token = _get_token(tenant)
-        response = requests.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type":  "application/json",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
+    for attempt, delay in enumerate(_RETRY_BACKOFF, start=1):
+        if delay:
+            time.sleep(delay)
 
-        # Brokerware returns {"loadId": <int>} on success
-        shipment_id = (
-            data.get("loadId")
-            or data.get("shipmentId")
-            or data.get("ShipmentId")
-            or data.get("id")
-            or (str(data) if isinstance(data, (int, str)) else None)
-        )
-
-        logger.info(f"Brokerware shipment created successfully: id={shipment_id}")
-        return CreateShipmentResult(
-            success=True,
-            shipment_id=str(shipment_id) if shipment_id else None,
-            raw_response=data,
-        )
-
-    except requests.HTTPError as e:
-        error_body = ""
         try:
-            error_body = e.response.json()
-        except Exception:
-            error_body = e.response.text if e.response else str(e)
+            token = _get_token(tenant)
+            response = requests.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type":  "application/json",
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        logger.error(f"Brokerware API HTTP error {e.response.status_code}: {error_body}")
-        return CreateShipmentResult(
-            success=False,
-            error=f"HTTP {e.response.status_code}: {error_body}",
-        )
+            # Brokerware returns {"loadId": <int>} on success
+            shipment_id = (
+                data.get("loadId")
+                or data.get("shipmentId")
+                or data.get("ShipmentId")
+                or data.get("id")
+                or (str(data) if isinstance(data, (int, str)) else None)
+            )
 
-    except Exception as e:
-        logger.error(f"Brokerware API request failed: {e}")
-        return CreateShipmentResult(success=False, error=str(e))
+            logger.info("Brokerware shipment created successfully: id=%s", shipment_id)
+            return CreateShipmentResult(
+                success=True,
+                shipment_id=str(shipment_id) if shipment_id else None,
+                raw_response=data,
+            )
+
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            error_body = ""
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = e.response.text if e.response else str(e)
+
+            if status not in _RETRYABLE_HTTP_STATUS or attempt == max_attempts:
+                logger.error(
+                    "Brokerware API HTTP error %s (attempt %d/%d): %s",
+                    status, attempt, max_attempts, error_body,
+                )
+                return CreateShipmentResult(
+                    success=False,
+                    error=f"HTTP {status}: {error_body}",
+                )
+            logger.warning(
+                "Brokerware API HTTP %s on attempt %d/%d — retrying in %ds",
+                status, attempt, max_attempts, _RETRY_BACKOFF[attempt],
+            )
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt == max_attempts:
+                logger.error(
+                    "Brokerware API request failed after %d attempt(s): %s",
+                    max_attempts, e,
+                )
+                return CreateShipmentResult(success=False, error=str(e))
+            logger.warning(
+                "Brokerware API attempt %d/%d failed (%s) — retrying in %ds",
+                attempt, max_attempts, type(e).__name__, _RETRY_BACKOFF[attempt],
+            )
+
+        except Exception as e:
+            logger.error("Brokerware API request failed: %s", e)
+            return CreateShipmentResult(success=False, error=str(e))
+
+    # Should be unreachable, but keeps type-checker happy.
+    return CreateShipmentResult(success=False, error="Max retries exceeded")
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +417,24 @@ def match_customer(sender_email: str, receiver_email: str = "", mailbox_upn: str
     An empty matches list means no confident customer was found (caller then
     treats customerId as None — a wrong id is worse than none).
 
+    On a successful match, ensure_customer_exists() is called so the customer
+    is automatically seeded into customer_retry_config even if sync_from_brokerware()
+    has not been run yet (zero-config hot-path seeding).
+
     Args:
         mailbox_upn: Receiving mailbox UPN — selects the correct Brokerware tenant.
     """
+    from urllib.parse import urlparse as _urlparse
     contacts = _get_contacts_cached(mailbox_upn)
     if not contacts:
         logger.warning("No Brokerware contacts available — cannot match customer")
         return {"matches": [], "is_broker_match": False}
+
+    # Derive tenant domain once — used for auto-seeding the retry config.
+    _tenant = _load_tenant(mailbox_upn)
+    _raw_url = _tenant.base_url or ""
+    _parsed  = _urlparse(_raw_url if "://" in _raw_url else f"https://{_raw_url}")
+    _domain  = _parsed.hostname or _raw_url
 
     for email in (sender_email, receiver_email):
         result = _match_one_email(contacts, email)
@@ -395,6 +445,19 @@ def match_customer(sender_email: str, receiver_email: str = "", mailbox_upn: str
                 email, matches[0]["customerId"],
                 "confident" if confident else "ambiguous",
             )
+            if confident:
+                # Auto-seed the customer into customer_retry_config (no-op if already present).
+                try:
+                    from src.db.retry_config_repository import ensure_customer_exists
+                    for m in matches:
+                        if m.get("customerId") is not None:
+                            ensure_customer_exists(
+                                customer_id=int(m["customerId"]),
+                                client_id=int(m["clientId"]) if m.get("clientId") is not None else None,
+                                domain=_domain,
+                            )
+                except Exception as _exc:
+                    logger.warning("match_customer: ensure_customer_exists failed: %s", _exc)
             return {"matches": matches, "is_broker_match": confident}
 
     logger.info("No Brokerware customer match for sender=%s / receiver=%s",

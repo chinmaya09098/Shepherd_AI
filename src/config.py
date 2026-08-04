@@ -214,6 +214,19 @@ class Config:
         "AZURE_SEARCH_CONTEXT_INDEX_NAME", "shipment-context"
     )
 
+    # ── Alerting ──────────────────────────────────────────────────────────────
+    # Health-monitor alerts are sent via one or both of these channels:
+    #
+    #   ALERT_WEBHOOK_URL  — POST JSON to a Teams / Slack / generic webhook.
+    #                        Leave blank to disable webhook alerts.
+    #   ALERT_EMAIL_TO     — Recipient address for alert emails (Graph sendMail).
+    #   ALERT_FROM_EMAIL   — Sender UPN used by Graph sendMail (must be a licensed
+    #                        mailbox the app has Mail.Send permission for).
+    #                        Leave blank to disable email alerts.
+    ALERT_WEBHOOK_URL:  str = os.getenv("ALERT_WEBHOOK_URL",  "")
+    ALERT_EMAIL_TO:     str = os.getenv("ALERT_EMAIL_TO",     "")
+    ALERT_FROM_EMAIL:   str = os.getenv("ALERT_FROM_EMAIL",   "")
+
     # Other Configuration
     EMAIL_EXAMPLES_DIR: str = os.getenv("EMAIL_EXAMPLES_DIR", "Load_Tender_Email_Examples")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "output")

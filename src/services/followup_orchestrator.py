@@ -463,3 +463,70 @@ def _extract_reference_ids(shipment: Shipment) -> List[str]:
             seen.add(r)
             unique.append(r)
     return unique
+
+
+# ---------------------------------------------------------------------------
+# Stale conversation expiry (scheduled job)
+# ---------------------------------------------------------------------------
+
+def expire_stale_conversations(tracker: Optional[ConversationTracker] = None) -> int:
+    """Mark conversations as expired when their pickup date has already passed.
+
+    Runs through every conversation currently in 'awaiting_reply' status and
+    checks whether the shipment's pickupDate is in the past (UTC).  Expired
+    conversations are saved with status='expired' so the follow-up scheduler
+    skips them.
+
+    Args:
+        tracker: ConversationTracker instance. A new one is created if not given.
+
+    Returns:
+        Number of conversations marked expired.
+    """
+    _tracker = tracker or ConversationTracker()
+    active   = _tracker.list_active()
+    now_utc  = datetime.now(timezone.utc).date()
+    expired  = 0
+
+    for state in active:
+        try:
+            # pickupDate lives inside partial_shipment → requiredFields → pickupDate
+            rf        = state.partial_shipment.get("requiredFields") or {}
+            raw_date  = rf.get("pickupDate")
+            if not raw_date:
+                continue
+
+            # Accept datetime objects, ISO strings, or date strings
+            if hasattr(raw_date, "date"):
+                pickup_date = raw_date.date()
+            else:
+                from dateutil.parser import parse as _parse
+                pickup_date = _parse(str(raw_date), fuzzy=True).date()
+
+            if pickup_date >= now_utc:
+                continue
+
+            # Pickup date is in the past — expire this conversation.
+            state.status = "expired"
+            state.add_event(
+                EVENT_MAX_RETRIES,
+                {"reason": "pickup_date_passed", "pickup_date": str(pickup_date)},
+            )
+            _tracker.save(state)
+            logger.info(
+                "expire_stale_conversations: expired conv_id=%s pickup_date=%s",
+                state.conversation_id[:20], pickup_date,
+            )
+            expired += 1
+
+        except Exception as exc:
+            logger.warning(
+                "expire_stale_conversations: error processing conv_id=%s — %s",
+                getattr(state, "conversation_id", "?")[:20], exc,
+            )
+
+    logger.info(
+        "expire_stale_conversations: %d conversation(s) expired out of %d active",
+        expired, len(active),
+    )
+    return expired

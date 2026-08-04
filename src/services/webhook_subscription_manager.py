@@ -269,3 +269,73 @@ class WebhookSubscriptionManager:
             notification_url=url,
             client_state=client_state,
         )
+
+    def auto_register_all_mailboxes(
+        self,
+        notification_url: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Ensure every configured mailbox has an active Graph subscription.
+
+        Reads ``Config.get_mailbox_user_ids()`` for the list of mailbox UPNs /
+        object IDs.  For each mailbox, lists the current Graph subscriptions and
+        registers a new one only if no active subscription already covers that
+        inbox resource.
+
+        This method is safe to call on every scheduler run — it is idempotent
+        (will not create duplicate subscriptions).
+
+        Args:
+            notification_url: Override the webhook endpoint URL. Falls back to
+                              ``Config.GRAPH_WEBHOOK_NOTIFICATION_URL``.
+
+        Returns:
+            Dict mapping each user_id to the subscription_id that covers it
+            (or None if registration failed or notification_url is not set).
+        """
+        url = notification_url or Config.GRAPH_WEBHOOK_NOTIFICATION_URL
+        if not url:
+            logger.warning(
+                "auto_register_all_mailboxes: GRAPH_WEBHOOK_NOTIFICATION_URL not configured — skipping"
+            )
+            return {}
+
+        user_ids = Config.get_mailbox_user_ids()
+        if not user_ids:
+            logger.warning(
+                "auto_register_all_mailboxes: no mailbox UPNs configured — skipping"
+            )
+            return {}
+
+        # Build a set of inbox resource paths already covered by active subscriptions.
+        active_subs  = self.list_active()
+        covered      = {s.get("resource", "").lower() for s in active_subs}
+
+        result: Dict[str, Optional[str]] = {}
+        for uid in user_ids:
+            resource = f"users/{uid}/mailFolders/Inbox/messages"
+            if resource.lower() in covered:
+                logger.info(
+                    "auto_register_all_mailboxes: subscription already active for %s", uid
+                )
+                # Find and return the existing subscription id.
+                for s in active_subs:
+                    if s.get("resource", "").lower() == resource.lower():
+                        result[uid] = s.get("id")
+                        break
+                else:
+                    result[uid] = None
+                continue
+
+            sub_id = self.register_inbox(user_id=uid, notification_url=url)
+            result[uid] = sub_id
+            if sub_id:
+                logger.info(
+                    "auto_register_all_mailboxes: registered subscription %s for %s",
+                    sub_id, uid,
+                )
+            else:
+                logger.error(
+                    "auto_register_all_mailboxes: failed to register subscription for %s", uid
+                )
+
+        return result

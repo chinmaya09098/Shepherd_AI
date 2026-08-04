@@ -209,17 +209,49 @@ class ConversationTracker:
         return state if (state and state.status == "awaiting_reply") else None
 
     def list_active(self) -> List[ConversationState]:
-        """Return all conversations currently in 'awaiting_reply' status."""
+        """Return all conversations currently in 'awaiting_reply' status.
+
+        Sources (in order, deduplicating by conversation_id):
+          1. In-memory cache (fastest — same process)
+          2. Azure Blob Storage (production — across process restarts / scheduler runs)
+          3. Local disk (development fallback / offline)
+        """
         active:   List[ConversationState] = []
         seen_ids: set                     = set()
 
-        # In-memory cache first
+        # 1. In-memory cache first
         for state in list(self._cache.values()):
             if state.status == "awaiting_reply":
                 active.append(state)
                 seen_ids.add(state.conversation_id)
 
-        # Local disk (captures states from previous sessions)
+        # 2. Azure Blob Storage — essential when running as a fresh scheduler process
+        if Config.AZURE_STORAGE_CONNECTION_STRING:
+            try:
+                from azure.storage.blob import BlobServiceClient
+                service   = BlobServiceClient.from_connection_string(Config.AZURE_STORAGE_CONNECTION_STRING)
+                container = Config.AZURE_STORAGE_LOGS_CONTAINER or "processed-logs"
+                prefix    = _blob_prefix()
+                cc        = service.get_container_client(container)
+                for blob_props in cc.list_blobs(name_starts_with=prefix):
+                    if not blob_props.name.endswith(".json"):
+                        continue
+                    try:
+                        data  = cc.get_blob_client(blob_props.name).download_blob().readall()
+                        state = ConversationState.model_validate_json(data)
+                        if (
+                            state.status == "awaiting_reply"
+                            and state.conversation_id not in seen_ids
+                        ):
+                            active.append(state)
+                            seen_ids.add(state.conversation_id)
+                            self._cache[state.conversation_id] = state
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning("list_active: blob enumeration failed — %s", exc)
+
+        # 3. Local disk (captures states from previous sessions / dev fallback)
         if _LOCAL_DIR.exists():
             for json_file in _LOCAL_DIR.glob("*.json"):
                 try:
