@@ -7,6 +7,7 @@ import tempfile
 import json
 import logging
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 import sys
@@ -849,26 +850,42 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
         attachments = email_data.get('attachments', [])
 
         if attachments:
-            # Pre-extract text from all attachments
+            # Pre-extract text from all attachments — run OCR in parallel
             attachment_data = []
             raw_cu = {}
-            for attachment in attachments:
-                result = content_extractor.extract_text(attachment['filepath'])
-                if result:
-                    text, confidence, raw_result = result
-                    attachment_data.append({'attachment': attachment, 'text': text, 'confidence': confidence})
-                    if raw_result:
-                        raw_cu[attachment['filename']] = raw_result
-                else:
-                    st.warning(f"No text extracted from {attachment['filename']}, skipping")
+            with st.spinner(f"Extracting text from {len(attachments)} attachment(s) in parallel..."):
+                def _ocr_one(att):
+                    return att, content_extractor.extract_text(att['filepath'])
+
+                with ThreadPoolExecutor(max_workers=min(len(attachments), 5)) as pool:
+                    futures = {pool.submit(_ocr_one, att): att for att in attachments}
+                    for future in as_completed(futures):
+                        att, result = future.result()
+                        if result:
+                            text, confidence, raw_result = result
+                            attachment_data.append({'attachment': att, 'text': text, 'confidence': confidence})
+                            if raw_result:
+                                raw_cu[att['filename']] = raw_result
+                        else:
+                            st.warning(f"No text extracted from {att['filename']}, skipping")
+            # Restore original attachment order
+            order = {att['filename']: i for i, att in enumerate(attachments)}
+            attachment_data.sort(key=lambda d: order.get(d['attachment']['filename'], 999))
             st.session_state.raw_cu_results = raw_cu if raw_cu else None
 
-            # Per-source structured extraction
-            with st.spinner("Extracting structured data per source..."):
+            # Per-source structured extraction — run all OpenAI calls in parallel
+            with st.spinner("Extracting structured data from all sources in parallel..."):
+                sources = [("emailBody", email_data['body'])] + [
+                    (d['attachment']['filename'], d['text']) for d in attachment_data
+                ]
                 breakdown = {}
-                breakdown["emailBody"] = openai_agent.extract_source_fields(email_data['body'])
-                for d in attachment_data:
-                    breakdown[d['attachment']['filename']] = openai_agent.extract_source_fields(d['text'])
+                def _extract_source(name_text):
+                    name, text = name_text
+                    return name, openai_agent.extract_source_fields(text)
+
+                with ThreadPoolExecutor(max_workers=min(len(sources), 6)) as pool:
+                    for name, fields in pool.map(_extract_source, sources):
+                        breakdown[name] = fields
             st.session_state.source_breakdown = breakdown
 
             # Pass 1: envelope
@@ -901,24 +918,21 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                 if body_shipments:
                     st.success(f"Extracted {len(body_shipments)} shipment(s) from email body")
 
-            # Pass 2: per-attachment extraction
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for idx, data in enumerate(attachment_data, 1):
-                attachment = data['attachment']
-                status_text.markdown(
-                    f'<p style="color: #FFFFFF !important; font-size: 16px; font-weight: 500;">'
-                    f'Processing attachment {idx}/{len(attachment_data)}: {attachment["filename"]}</p>',
-                    unsafe_allow_html=True,
-                )
-                progress_bar.progress(idx / len(attachment_data))
-
-                with st.spinner(f"Extracting shipment data from {attachment['filename']}..."):
-                    shipment = openai_agent.extract_shipment_data(
+            # Pass 2: per-attachment extraction — run all in parallel
+            with st.spinner(f"Extracting shipment data from {len(attachment_data)} attachment(s) in parallel..."):
+                def _extract_shipment(idx_data):
+                    idx, data = idx_data
+                    return idx, data, openai_agent.extract_shipment_data(
                         attachment_text=data['text'],
                         envelope=envelope
                     )
+
+                with ThreadPoolExecutor(max_workers=min(len(attachment_data), 5)) as pool:
+                    extraction_results = list(pool.map(_extract_shipment, enumerate(attachment_data, 1)))
+                extraction_results.sort(key=lambda x: x[0])
+
+            for idx, data, shipment in extraction_results:
+                attachment = data['attachment']
 
                 if shipment:
                     fallback_items = []
@@ -960,9 +974,6 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                         _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
-
-            progress_bar.empty()
-            status_text.empty()
 
         else:
             st.info("No attachments found. Attempting to extract shipment data from email body...")
@@ -1397,31 +1408,48 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             st.session_state.graph_correlation_result = None
             st.rerun()
 
-    # Sidebar: show open conversations awaiting reply
-    _render_active_conversations_panel()
+    # Sidebar: show open conversations awaiting reply.
+    # Hide it once a follow-up has been sent so the main content gets full width.
+    # The sidebar comes back automatically when the user selects a new email
+    # (followup_results is reset to {} on every new email selection).
+    _followup_sent = any(
+        r and r.action in ("followup_sent", "complete")
+        for r in st.session_state.followup_results.values()
+    )
+    if not _followup_sent:
+        _render_active_conversations_panel()
 
-    # Auto-load inbox on every render — no button needed
-    with st.spinner("Loading inbox..."):
-        try:
-            updated_token, messages = run_async(
-                client.read_inbox(st.session_state.graph_token)
-            )
-            st.session_state.graph_token = updated_token
-            st.session_state.graph_messages = messages
+    # Load inbox only on first render or when user clicks Refresh — avoids
+    # re-fetching from Graph API on every Streamlit rerender (saves 2-5s per interaction).
+    col_refresh, col_status = st.columns([1, 5])
+    with col_refresh:
+        refresh_inbox = st.button("Refresh Inbox", key="graph_refresh_inbox")
+    with col_status:
+        if st.session_state.graph_messages:
+            st.caption(f"{len(st.session_state.graph_messages)} message(s) loaded")
 
-            # ── Phase 1: immediately store every inbox email to PostgreSQL ────
-            # class_code is NULL (unprocessed) at this point.
-            # update_email_class() will patch it once the pipeline runs.
+    if not st.session_state.graph_messages or refresh_inbox:
+        with st.spinner("Loading inbox..."):
             try:
-                from src.db.email_repository import upsert_inbox_email
-                for _m in (st.session_state.graph_messages or []):
-                    upsert_inbox_email(_m)
-            except Exception as _pe:
-                logger.warning("Inbox early-store to PostgreSQL failed (non-fatal): %s", _pe)
+                updated_token, messages = run_async(
+                    client.read_inbox(st.session_state.graph_token)
+                )
+                st.session_state.graph_token = updated_token
+                st.session_state.graph_messages = messages
 
-        except Exception as e:
-            st.error(f"Failed to load inbox: {e}")
-            logger.error(f"Graph inbox load error: {e}", exc_info=True)
+                # ── Phase 1: immediately store every inbox email to PostgreSQL ────
+                # class_code is NULL (unprocessed) at this point.
+                # update_email_class() will patch it once the pipeline runs.
+                try:
+                    from src.db.email_repository import upsert_inbox_email
+                    for _m in (st.session_state.graph_messages or []):
+                        upsert_inbox_email(_m)
+                except Exception as _pe:
+                    logger.warning("Inbox early-store to PostgreSQL failed (non-fatal): %s", _pe)
+
+            except Exception as e:
+                st.error(f"Failed to load inbox: {e}")
+                logger.error(f"Graph inbox load error: {e}", exc_info=True)
 
     # ── Email list and processing ─────────────────────────────────────────────
     if st.session_state.graph_messages:
@@ -1560,6 +1588,43 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                         st.session_state.graph_email_processed = True
                         # Sync to shared shipments so display_shipment/missing-fields works correctly
                         st.session_state.shipments = shipments_data
+
+                        # ── Auto follow-up: send immediately when fields are missing ──
+                        # Only for fresh emails (not customer replies — those go through handle_reply).
+                        if not st.session_state.graph_is_tracked_reply:
+                            _auto_client = _init_graph_client()
+                            _auto_token  = st.session_state.graph_token
+                            if _auto_client and _auto_token:
+                                for _idx, _sd in enumerate(shipments_data):
+                                    _sh = _sd["shipment"]
+                                    if (
+                                        _sh.email_type in ("shipment_tender", "shipment_quote")
+                                        and _has_blocking_missing_fields(_sh)
+                                        and _idx not in st.session_state.followup_results
+                                    ):
+                                        with st.spinner(
+                                            "Missing fields detected — auto-sending follow-up email..."
+                                        ):
+                                            try:
+                                                _orch   = FollowupOrchestrator()
+                                                _result = run_async(
+                                                    _orch.handle_initial_extraction(
+                                                        shipment=_sh,
+                                                        message=selected_message,
+                                                        graph_client=_auto_client,
+                                                        access_token=_auto_token.access_token,
+                                                        customer_id=_get_customer_id(_sd),
+                                                    )
+                                                )
+                                                st.session_state.followup_results[_idx] = _result
+                                            except Exception as _exc:
+                                                logger.error(
+                                                    "Auto follow-up failed: %s", _exc, exc_info=True
+                                                )
+                                                st.session_state.followup_results[_idx] = FollowupResult(
+                                                    action="error",
+                                                    message=str(_exc),
+                                                )
                     else:
                         st.error("No shipments were extracted from this email.")
 
@@ -1594,7 +1659,7 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                 st.error("Classified as spam — no shipment data extracted.")
                 return
 
-            if s.email_type == "shipment_tender" and _has_blocking_missing_fields(s):
+            if s.email_type in ("shipment_tender", "shipment_quote") and _has_blocking_missing_fields(s):
                 _display_missing_fields_form(shipment_idx)
                 st.divider()
 
@@ -2285,16 +2350,18 @@ def _apply_missing_fields(shipment_idx: int, field_values: dict):
     ]
     st.session_state.shipments[shipment_idx]["shipment"] = shipment
 
-    # Once all blocking required fields are filled, save to blob
+    # Once all blocking required fields are filled, save to blob and submit to Brokerware
     if not _has_blocking_missing_fields(shipment):
         shipment_data = st.session_state.shipments[shipment_idx]
+        cid = _get_customer_id(shipment_data)
         _save_shipment_json_to_blob(
             shipment,
             email_name=shipment_data.get("email_name", "unknown"),
             source_name=shipment_data["attachment_name"],
             index=shipment_data["attachment_index"],
-            customer_id=_get_customer_id(shipment_data),
+            customer_id=cid,
         )
+        _submit_to_brokerware(shipment, customer_id=cid)
 
 
 def _display_missing_fields_form(shipment_idx: int):
@@ -2482,7 +2549,7 @@ def display_shipment(shipment: Shipment, attachment_name: str, index: int, shipm
         return
 
     # Missing fields form (shipment creation only)
-    if shipment.email_type == "shipment_tender" and _has_blocking_missing_fields(shipment):
+    if shipment.email_type in ("shipment_tender", "shipment_quote") and _has_blocking_missing_fields(shipment):
         _display_missing_fields_form(shipment_idx)
         st.divider()
 

@@ -41,3 +41,6 @@ azure-storage-queue>=12.9.0
 
 # JWT signature verification against Azure AD JWKS (RS256)
 PyJWT>=2.8.0
+
+# Background scheduler (used by run_scheduler.py for automated jobs)
+apscheduler>=3.10.0

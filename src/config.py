@@ -49,11 +49,18 @@ class Config:
     HYPERION_CLIENT_ID: Optional[str] = os.getenv("HYPERION_CLIENT_ID")
     HYPERION_CLIENT_SECRET: Optional[str] = os.getenv("HYPERION_CLIENT_SECRET")
 
-    # Brokerware TMS API
+    # Brokerware TMS API — default/fallback credentials (single-tenant legacy)
     BROKERWARE_BASE_URL: str = os.getenv("BROKERWARE_BASE_URL", "https://shepherd.brokerware.io")
     BROKERWARE_CLIENT_ID: Optional[str] = os.getenv("BROKERWARE_CLIENT_ID")
     BROKERWARE_CLIENT_SECRET: Optional[str] = os.getenv("BROKERWARE_CLIENT_SECRET")
-    BROKERWARE_DEFAULT_CUSTOMER_ID: int = int(os.getenv("BROKERWARE_DEFAULT_CUSTOMER_ID", "0"))
+
+    # Multi-tenant Brokerware routing: JSON map of lowercase mailbox UPN → tenant key.
+    # Tenant key must match the BROKERWARE_<KEY>_* env var prefix (e.g. "shepherd",
+    # "shepherdwest"). Example:
+    #   {"shepherd@ad.3plsystems.com": "shepherd",
+    #    "shepherd1@3plsystems0.onmicrosoft.com": "shepherd",
+    #    "shepherd2@3plsystems0.onmicrosoft.com": "shepherdwest"}
+    BROKERWARE_MAILBOX_TENANT_MAP: str = os.getenv("BROKERWARE_MAILBOX_TENANT_MAP", "{}")
 
     # Azure AI Search
     AZURE_SEARCH_ENDPOINT: Optional[str] = os.getenv("AZURE_SEARCH_ENDPOINT")
@@ -206,6 +213,19 @@ class Config:
     AZURE_SEARCH_CONTEXT_INDEX_NAME: str = os.getenv(
         "AZURE_SEARCH_CONTEXT_INDEX_NAME", "shipment-context"
     )
+
+    # ── Alerting ──────────────────────────────────────────────────────────────
+    # Health-monitor alerts are sent via one or both of these channels:
+    #
+    #   ALERT_WEBHOOK_URL  — POST JSON to a Teams / Slack / generic webhook.
+    #                        Leave blank to disable webhook alerts.
+    #   ALERT_EMAIL_TO     — Recipient address for alert emails (Graph sendMail).
+    #   ALERT_FROM_EMAIL   — Sender UPN used by Graph sendMail (must be a licensed
+    #                        mailbox the app has Mail.Send permission for).
+    #                        Leave blank to disable email alerts.
+    ALERT_WEBHOOK_URL:  str = os.getenv("ALERT_WEBHOOK_URL",  "")
+    ALERT_EMAIL_TO:     str = os.getenv("ALERT_EMAIL_TO",     "")
+    ALERT_FROM_EMAIL:   str = os.getenv("ALERT_FROM_EMAIL",   "")
 
     # Other Configuration
     EMAIL_EXAMPLES_DIR: str = os.getenv("EMAIL_EXAMPLES_DIR", "Load_Tender_Email_Examples")
