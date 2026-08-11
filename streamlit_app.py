@@ -791,7 +791,7 @@ def _init_graph_client() -> Optional[GraphClient]:
     return GraphClient(config)
 
 
-def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
+def process_graph_email(email_data: dict, message_id: str, submit_shipments: bool = True) -> List[dict]:
     """
     Process a Graph API email dict through the full extraction pipeline.
 
@@ -801,6 +801,9 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
     Args:
         email_data: EMLParser-compatible dict from GraphEmailReader._convert_message()
         message_id: Graph message ID (used for naming saved outputs)
+        submit_shipments: When False, extract only and skip Brokerware submission.
+            Used for tracked replies, where the shipment must be created from the
+            MERGED thread data (after handle_reply), not this single email.
 
     Returns:
         List of shipment dicts (same schema as process_email_blob)
@@ -967,7 +970,8 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                             index=idx,
                             customer_id=resolved_customer_id,
                         )
-                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                        if submit_shipments:
+                            _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -995,7 +999,8 @@ def process_graph_email(email_data: dict, message_id: str) -> List[dict]:
                         index=1,
                         customer_id=resolved_customer_id,
                     )
-                    _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                    if submit_shipments:
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
@@ -1548,9 +1553,13 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                             "Reply data will be merged with the existing partial shipment."
                         )
 
+                    # For a tracked reply, extract only — the shipment is created from
+                    # the MERGED thread data after handle_reply (Approach A). For a fresh
+                    # email, submit normally inside process_graph_email.
                     shipments_data = process_graph_email(
                         email_data=email_data,
                         message_id=selected_message.id or "",
+                        submit_shipments=not st.session_state.graph_is_tracked_reply,
                     )
 
                     # If it's a reply, merge the extracted data with the tracked conversation state
@@ -1575,6 +1584,23 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                                     shipments_data[0]["shipment"] = reply_result.shipment
                                 # Store the reply result so the UI can show the appropriate status
                                 st.session_state.followup_results[0] = reply_result
+
+                                # ── Approach A: when this reply COMPLETES the thread,
+                                # create the shipment from the MERGED conversation data
+                                # (all fields gathered across the whole email thread) ──
+                                if reply_result.action == "complete" and reply_result.shipment:
+                                    _conv = _orchestrator.get_conversation_state(
+                                        reply_result.conversation_id
+                                    )
+                                    _cust = (
+                                        _conv.customer_id if _conv and _conv.customer_id is not None
+                                        else _get_customer_id(shipments_data[0])
+                                    )
+                                    st.success(
+                                        "Thread complete — all required fields gathered across the "
+                                        "conversation. Creating shipment from the merged thread…"
+                                    )
+                                    _submit_to_brokerware(reply_result.shipment, customer_id=_cust)
                         except Exception as exc:
                             logger.error("Reply merge failed: %s", exc, exc_info=True)
                             st.warning(f"Reply merge encountered an error: {exc}")
