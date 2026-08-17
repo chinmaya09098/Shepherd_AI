@@ -1,17 +1,19 @@
 """
 Brokerware TMS API client.
 
-Handles OAuth 2.0 Client Credentials token lifecycle and shipment creation.
+Handles OAuth 2.0 token lifecycle and shipment creation / customer contact lookup.
 Tokens are fetched on first use and refreshed automatically when expired.
 
 Multi-tenant: tenant config is resolved from the receiving mailbox UPN via
 BROKERWARE_MAILBOX_TENANT_MAP.  Per-tenant credentials are read from
-BROKERWARE_<KEY>_BASE_URL / _CLIENT_ID / _CLIENT_SECRET env vars.
+BROKERWARE_<KEY>_* env vars.
 
 API Endpoints:
-  Auth:            POST {base_url}/connect/token
-  CreateShipment:  POST {base_url}/api/clientv1/CreateShipmentAPI
-  CustomerContacts: GET {base_url}/api/clientv1/CustomerContactsSummary?pageSize=&page=
+  Auth (client creds):  POST {base_url}/connect/token  (grant_type=client_credentials)
+  Auth (password):      POST {base_url}/connect/token  (grant_type=password)
+  CreateShipment:       POST {base_url}/api/clientv1/CreateShipmentAPI
+  List customers:       GET  {base_url}/api/client/{brokerClientId}/customer
+  List contacts:        GET  {base_url}/api/client/{brokerClientId}/customer/{customerId}/contact
 """
 import json as _json
 import os
@@ -33,10 +35,13 @@ logger = get_logger(__name__)
 
 @dataclass
 class _BrokerwareTenant:
-    key: str          # e.g. "shepherd", "shepherdwest", "default"
+    key: str            # e.g. "shepherd", "shepherdwest", "default"
     base_url: str
     client_id: str
     client_secret: str
+    broker_client_id: str = ""   # Brokerware company ID (e.g. "4097939")
+    username: str = ""           # for password-grant contact lookup
+    password: str = ""           # for password-grant contact lookup
 
 
 def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
@@ -56,11 +61,16 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
 
     if key:
         prefix = f"BROKERWARE_{key.upper()}_"
-        base_url      = os.getenv(f"{prefix}BASE_URL")      or Config.BROKERWARE_BASE_URL
-        client_id     = os.getenv(f"{prefix}CLIENT_ID")     or Config.BROKERWARE_CLIENT_ID or ""
-        client_secret = os.getenv(f"{prefix}CLIENT_SECRET") or Config.BROKERWARE_CLIENT_SECRET or ""
+        base_url         = os.getenv(f"{prefix}BASE_URL")         or Config.BROKERWARE_BASE_URL
+        client_id        = os.getenv(f"{prefix}CLIENT_ID")        or Config.BROKERWARE_CLIENT_ID or ""
+        client_secret    = os.getenv(f"{prefix}CLIENT_SECRET")    or Config.BROKERWARE_CLIENT_SECRET or ""
+        broker_client_id = os.getenv(f"{prefix}BROKER_CLIENT_ID") or ""
+        username         = os.getenv(f"{prefix}USERNAME")         or ""
+        password         = os.getenv(f"{prefix}PASSWORD")         or ""
         return _BrokerwareTenant(key=key, base_url=base_url,
-                                 client_id=client_id, client_secret=client_secret)
+                                 client_id=client_id, client_secret=client_secret,
+                                 broker_client_id=broker_client_id,
+                                 username=username, password=password)
 
     # Default / fallback tenant
     return _BrokerwareTenant(
@@ -74,8 +84,10 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
 # ---------------------------------------------------------------------------
 # Per-tenant token cache (module-level — lives for the duration of the process)
 # ---------------------------------------------------------------------------
-# _tenant_tokens: { tenant_key -> {"token": str, "expires_at": float} }
+# _tenant_tokens:          { tenant_key -> {"token": str, "expires_at": float} }
+# _tenant_tokens_password: { tenant_key -> {"token": str, "expires_at": float} }
 _tenant_tokens: dict = {}
+_tenant_tokens_password: dict = {}
 _TOKEN_EXPIRY_BUFFER: int = 60   # refresh 60 s before actual expiry
 
 
@@ -123,11 +135,43 @@ def _fetch_token(tenant: _BrokerwareTenant) -> str:
 
 
 def _get_token(tenant: _BrokerwareTenant) -> str:
-    """Return a valid Bearer token for *tenant*, refreshing if expired."""
+    """Return a valid client-credentials Bearer token for *tenant*."""
     cached = _tenant_tokens.get(tenant.key)
     if not cached or time.time() >= cached["expires_at"]:
         return _fetch_token(tenant)
     return cached["token"]
+
+
+def _get_token_password(tenant: _BrokerwareTenant) -> Optional[str]:
+    """Return a password-grant Bearer token for *tenant* (used for contact lookup).
+
+    Returns None when username/password are not configured.
+    """
+    if not tenant.username or not tenant.password:
+        return None
+    cached = _tenant_tokens_password.get(tenant.key)
+    if cached and time.time() < cached["expires_at"]:
+        return cached["token"]
+    url = f"{tenant.base_url}/connect/token"
+    logger.info("Fetching Brokerware password-grant token for tenant=%s", tenant.key)
+    resp = requests.post(url, data={
+        "grant_type":    "password",
+        "client_id":     tenant.client_id,
+        "client_secret": tenant.client_secret,
+        "username":      tenant.username,
+        "password":      tenant.password,
+        "scope":         "openid profile",
+    }, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+    _tenant_tokens_password[tenant.key] = {
+        "token":      token,
+        "expires_at": time.time() + expires_in - _TOKEN_EXPIRY_BUFFER,
+    }
+    logger.info("Brokerware password token for tenant=%s acquired", tenant.key)
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -250,53 +294,115 @@ def create_shipment(
 
 
 # ---------------------------------------------------------------------------
-# CustomerContactsSummary
+# Customer contact lookup (real API: /api/client/{brokerClientId}/customer/...)
 # ---------------------------------------------------------------------------
 
 def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list:
     """
-    Fetch all customer contacts from Brokerware, paginating through every page.
+    Fetch all customer contacts from Brokerware using the real API endpoints.
 
-    Calls GET /api/clientv1/CustomerContactsSummary with pageSize + page params
-    and walks all pages using the `totalPages` value in the response.
+    Step 1: GET /api/client/{brokerClientId}/customer
+            → list of customers: [{id, name, ...}, ...]
+    Step 2: For each customer, GET
+            /api/client/{brokerClientId}/customer/{customerId}/contact?search=Active
+            → {"contacts": [{email, ...}, ...]}
+
+    Requires password-grant credentials (BROKERWARE_{KEY}_USERNAME / _PASSWORD)
+    and the company ID (BROKERWARE_{KEY}_BROKER_CLIENT_ID).
 
     Args:
-        page_size:   Records per page (1–10000; invalid values default to 10000).
+        page_size:   Unused — kept for backward-compat signature.
         mailbox_upn: Receiving mailbox UPN used to select the correct tenant.
 
     Returns:
         A list of contact dicts, each like:
-            {"clientId": int, "customerId": int, "email": str}
+            {"customerId": int, "customerName": str, "email": str,
+             "emailDomain": str, "clientId": None}
         Returns an empty list on failure (errors are logged, never raised).
     """
     tenant = _load_tenant(mailbox_upn)
-    url = f"{tenant.base_url}/api/clientv1/CustomerContactsSummary"
+
+    token = _get_token_password(tenant)
+    if not token:
+        logger.warning(
+            "get_customer_contacts: no password-grant token for tenant=%s "
+            "(USERNAME/PASSWORD not configured)", tenant.key,
+        )
+        return []
+
+    if not tenant.broker_client_id:
+        logger.warning(
+            "get_customer_contacts: BROKERWARE_%s_BROKER_CLIENT_ID not set",
+            tenant.key.upper(),
+        )
+        return []
+
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     contacts: list = []
-    page = 1
-    total_pages = 1
 
     try:
-        token = _get_token(tenant)
-        while page <= total_pages:
-            response = requests.get(
-                url,
-                params={"pageSize": page_size, "page": page},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
+        # Step 1 — list all customers for this broker client
+        customers_url = f"{tenant.base_url}/api/client/{tenant.broker_client_id}/customer"
+        cr = requests.get(customers_url, headers=hdrs, timeout=30)
+        cr.raise_for_status()
 
-            contacts.extend(data.get("contacts", []))
-            total_pages = data.get("totalPages", 1) or 1
-            logger.info(
-                "Brokerware contacts page %d/%d fetched (%d records so far) tenant=%s",
-                page, total_pages, len(contacts), tenant.key,
-            )
-            page += 1
+        raw = cr.json()
+        customers = raw if isinstance(raw, list) else raw.get("customers", raw.get("data", []))
+        logger.info(
+            "Brokerware: found %d customer(s) for tenant=%s broker_client_id=%s",
+            len(customers), tenant.key, tenant.broker_client_id,
+        )
 
-        logger.info("Fetched %d Brokerware customer contact(s) total tenant=%s",
-                    len(contacts), tenant.key)
+        # Step 2 — get contacts for each customer
+        for cust in customers:
+            cust_id   = cust.get("id") or cust.get("customerId")
+            cust_name = cust.get("name") or cust.get("customerName") or ""
+            if cust_id is None:
+                continue
+
+            contacts_url = (
+                f"{tenant.base_url}/api/client/{tenant.broker_client_id}"
+                f"/customer/{cust_id}/contact"
+            )
+            try:
+                resp = requests.get(
+                    contacts_url, params={"search": "Active"},
+                    headers=hdrs, timeout=30,
+                )
+                # Skip non-JSON responses (Angular SPA catch-all etc.)
+                ct = resp.headers.get("Content-Type", "")
+                if "json" not in ct:
+                    logger.debug(
+                        "Brokerware contacts for customerId=%s returned non-JSON (%s) — skipping",
+                        cust_id, ct,
+                    )
+                    continue
+                resp.raise_for_status()
+                raw_contacts = resp.json()
+                # Endpoint returns either a list directly or {"contacts": [...]}
+                c_list = (
+                    raw_contacts if isinstance(raw_contacts, list)
+                    else raw_contacts.get("contacts", [])
+                )
+                for c in c_list:
+                    email = (c.get("email") or "").strip()
+                    contacts.append({
+                        "customerId":   cust_id,
+                        "customerName": cust_name,
+                        "email":        email,
+                        "emailDomain":  email.split("@")[-1].lower() if "@" in email else "",
+                        "clientId":     None,
+                    })
+            except Exception as inner_e:
+                logger.warning(
+                    "Brokerware: failed to fetch contacts for customerId=%s tenant=%s: %s",
+                    cust_id, tenant.key, inner_e,
+                )
+
+        logger.info(
+            "Fetched %d Brokerware customer contact(s) total tenant=%s",
+            len(contacts), tenant.key,
+        )
         return contacts
 
     except requests.HTTPError as e:
@@ -305,13 +411,16 @@ def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list
             body = e.response.json()
         except Exception:
             body = e.response.text if e.response else str(e)
-        logger.error("Brokerware CustomerContactsSummary HTTP error %s: %s (tenant=%s)",
-                     getattr(e.response, "status_code", "?"), body, tenant.key)
-        return contacts  # return whatever pages we managed to fetch
+        logger.error(
+            "Brokerware customer list HTTP error %s: %s (tenant=%s)",
+            getattr(e.response, "status_code", "?"), body, tenant.key,
+        )
+        return contacts
 
     except Exception as e:
-        logger.error("Brokerware CustomerContactsSummary request failed: %s (tenant=%s)",
-                     e, tenant.key)
+        logger.error(
+            "Brokerware customer list request failed: %s (tenant=%s)", e, tenant.key,
+        )
         return contacts
 
 
@@ -347,16 +456,13 @@ def _get_contacts_cached(mailbox_upn: str = "") -> list:
 
 
 def _to_match(contact: dict) -> dict:
-    """Shape a Brokerware contact into the match dict the pipeline expects.
-
-    (customerName is None — the Brokerware summary endpoint does not return it.)
-    """
+    """Shape a Brokerware contact into the match dict the pipeline expects."""
     email = (contact.get("email") or "").strip()
     return {
         "customerId":   contact.get("customerId"),
-        "customerName": None,
+        "customerName": contact.get("customerName") or None,
         "email":        email,
-        "emailDomain":  email.split("@")[-1].lower() if "@" in email else "",
+        "emailDomain":  contact.get("emailDomain") or (email.split("@")[-1].lower() if "@" in email else ""),
         "clientId":     contact.get("clientId"),
     }
 
@@ -403,62 +509,107 @@ def _match_one_email(contacts: list, email: str):
     return None
 
 
+def _match_from_static_map(sender_email: str, tenant_key: str) -> Optional[dict]:
+    """
+    Check BROKERWARE_CUSTOMER_EMAIL_MAP for a static email → customer_id mapping.
+
+    Returns a match dict compatible with match_customer's return shape, or None.
+    Map format (env var JSON):
+        { "jack3pl@outlook.com": {"shepherd": 4098014, "shepherdwest": 5001} }
+    """
+    import json as _json
+    try:
+        raw = Config.BROKERWARE_CUSTOMER_EMAIL_MAP or "{}"
+        email_map: dict = _json.loads(raw)
+    except Exception:
+        return None
+
+    normalized = (sender_email or "").strip().lower()
+    entry = email_map.get(normalized) or email_map.get(sender_email or "")
+    if not entry:
+        return None
+
+    customer_id = entry.get(tenant_key)
+    if customer_id is None:
+        return None
+
+    logger.info(
+        "Static map match: email=%s tenant=%s → customerId=%s",
+        normalized, tenant_key, customer_id,
+    )
+    return {
+        "matches": [{
+            "customerId":   int(customer_id),
+            "customerName": "",
+            "email":        normalized,
+            "emailDomain":  normalized.split("@")[-1] if "@" in normalized else "",
+            "clientId":     None,
+        }],
+        "is_broker_match": True,
+    }
+
+
 def match_customer(sender_email: str, receiver_email: str = "", mailbox_upn: str = "") -> dict:
     """
-    Resolve an email to a Brokerware customer by direct lookup against the
-    CustomerContactsSummary list (replaces the Hyperion + vector-search path).
+    Resolve an email to a Brokerware customer.
 
-    Tries the sender first, then the receiver. Returns the same shape the
-    pipeline already consumes:
+    Lookup order:
+      1. BROKERWARE_CUSTOMER_EMAIL_MAP static config (always wins if set).
+      2. Live CustomerContacts API (falls back gracefully when API returns nothing).
+
+    Returns the shape the pipeline already consumes:
         {
           "matches": [ {customerId, customerName, email, emailDomain, clientId}, ... ],
           "is_broker_match": bool   # True = confident, use customerId directly
         }
-    An empty matches list means no confident customer was found (caller then
-    treats customerId as None — a wrong id is worse than none).
-
-    On a successful match, ensure_customer_exists() is called so the customer
-    is automatically seeded into customer_retry_config even if sync_from_brokerware()
-    has not been run yet (zero-config hot-path seeding).
 
     Args:
         mailbox_upn: Receiving mailbox UPN — selects the correct Brokerware tenant.
     """
     from urllib.parse import urlparse as _urlparse
+
+    _tenant  = _load_tenant(mailbox_upn)
+    _raw_url = _tenant.base_url or ""
+    _parsed  = _urlparse(_raw_url if "://" in _raw_url else f"https://{_raw_url}")
+    _domain  = _parsed.hostname or _raw_url
+
+    def _seed_and_return(result: dict) -> dict:
+        """Auto-seed the matched customer into customer_retry_config then return."""
+        if result.get("is_broker_match"):
+            try:
+                from src.db.retry_config_repository import ensure_customer_exists
+                for m in result["matches"]:
+                    if m.get("customerId") is not None:
+                        ensure_customer_exists(
+                            customer_id=int(m["customerId"]),
+                            client_id=int(m["clientId"]) if m.get("clientId") is not None else None,
+                            domain=_domain,
+                        )
+            except Exception as _exc:
+                logger.warning("match_customer: ensure_customer_exists failed: %s", _exc)
+        return result
+
+    # ── 1. Static map (highest priority) ─────────────────────────────────────
+    static = _match_from_static_map(sender_email, _tenant.key)
+    if static:
+        return _seed_and_return(static)
+
+    # ── 2. Live Brokerware CustomerContacts API ───────────────────────────────
     contacts = _get_contacts_cached(mailbox_upn)
     if not contacts:
         logger.warning("No Brokerware contacts available — cannot match customer")
         return {"matches": [], "is_broker_match": False}
-
-    # Derive tenant domain once — used for auto-seeding the retry config.
-    _tenant = _load_tenant(mailbox_upn)
-    _raw_url = _tenant.base_url or ""
-    _parsed  = _urlparse(_raw_url if "://" in _raw_url else f"https://{_raw_url}")
-    _domain  = _parsed.hostname or _raw_url
 
     for email in (sender_email, receiver_email):
         result = _match_one_email(contacts, email)
         if result:
             matches, confident = result
             logger.info(
-                "Brokerware customer match for '%s' → customerId=%s (%s)",
+                "Brokerware API match for '%s' → customerId=%s (%s)",
                 email, matches[0]["customerId"],
                 "confident" if confident else "ambiguous",
             )
-            if confident:
-                # Auto-seed the customer into customer_retry_config (no-op if already present).
-                try:
-                    from src.db.retry_config_repository import ensure_customer_exists
-                    for m in matches:
-                        if m.get("customerId") is not None:
-                            ensure_customer_exists(
-                                customer_id=int(m["customerId"]),
-                                client_id=int(m["clientId"]) if m.get("clientId") is not None else None,
-                                domain=_domain,
-                            )
-                except Exception as _exc:
-                    logger.warning("match_customer: ensure_customer_exists failed: %s", _exc)
-            return {"matches": matches, "is_broker_match": confident}
+            return _seed_and_return({"matches": matches, "is_broker_match": confident})
 
     logger.info("No Brokerware customer match for sender=%s / receiver=%s",
                 sender_email, receiver_email)
