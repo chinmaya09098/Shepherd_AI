@@ -35,8 +35,10 @@ logger = get_logger(__name__)
 class _BrokerwareTenant:
     key: str          # e.g. "shepherd", "shepherdwest", "default"
     base_url: str
-    client_id: str
+    client_id: str        # OAuth client id — used for /connect/token
     client_secret: str
+    client_number: str = ""  # numeric Brokerware client id — used in the API URL path
+                             # (e.g. /api/client/4097939/customer)
 
 
 def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
@@ -59,8 +61,10 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
         base_url      = os.getenv(f"{prefix}BASE_URL")      or Config.BROKERWARE_BASE_URL
         client_id     = os.getenv(f"{prefix}CLIENT_ID")     or Config.BROKERWARE_CLIENT_ID or ""
         client_secret = os.getenv(f"{prefix}CLIENT_SECRET") or Config.BROKERWARE_CLIENT_SECRET or ""
+        client_number = os.getenv(f"{prefix}CLIENT_NUMBER") or Config.BROKERWARE_CLIENT_NUMBER or ""
         return _BrokerwareTenant(key=key, base_url=base_url,
-                                 client_id=client_id, client_secret=client_secret)
+                                 client_id=client_id, client_secret=client_secret,
+                                 client_number=client_number)
 
     # Default / fallback tenant
     return _BrokerwareTenant(
@@ -68,6 +72,7 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
         base_url=Config.BROKERWARE_BASE_URL,
         client_id=Config.BROKERWARE_CLIENT_ID or "",
         client_secret=Config.BROKERWARE_CLIENT_SECRET or "",
+        client_number=Config.BROKERWARE_CLIENT_NUMBER or "",
     )
 
 
@@ -162,8 +167,18 @@ def create_shipment(
     """
     tenant = _load_tenant(mailbox_upn)
 
+    if not tenant.client_number:
+        return CreateShipmentResult(success=False,
+                                    error="Brokerware client_number not configured for this tenant")
+    if customer_id is None:
+        return CreateShipmentResult(success=False, error="No customerId — cannot create shipment")
+
     payload = format_client_json(shipment, customer_id=customer_id)
-    url = f"{tenant.base_url}/api/clientv1/CreateShipmentAPI"
+    # New nested API: POST /api/client/{clientNumber}/customer/{customerId}/shipment
+    # (replaces the removed /api/clientv1/CreateShipmentAPI). customerId is in the
+    # URL path now. NOTE: the request body is still format_client_json — verify the
+    # exact payload against a real shipment-create captured from the Brokerware UI.
+    url = f"{tenant.base_url}/api/client/{tenant.client_number}/customer/{customer_id}/shipment"
     max_attempts = len(_RETRY_BACKOFF)
 
     logger.info(
@@ -255,63 +270,79 @@ def create_shipment(
 
 def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list:
     """
-    Fetch all customer contacts from Brokerware, paginating through every page.
-
-    Calls GET /api/clientv1/CustomerContactsSummary with pageSize + page params
-    and walks all pages using the `totalPages` value in the response.
+    Fetch all customer contacts for the tenant via Brokerware's nested API:
+      1. GET /api/client/{clientNumber}/customer              → list of customers
+      2. GET /api/client/{clientNumber}/customer/{id}/contact → contacts per customer
 
     Args:
-        page_size:   Records per page (1–10000; invalid values default to 10000).
+        page_size:   Unused (kept for signature compatibility — the new API is
+                     not paginated; all customers are returned in one call).
         mailbox_upn: Receiving mailbox UPN used to select the correct tenant.
 
     Returns:
         A list of contact dicts, each like:
-            {"clientId": int, "customerId": int, "email": str}
+            {"clientId": str, "customerId": int, "customerName": str, "email": str}
         Returns an empty list on failure (errors are logged, never raised).
     """
     tenant = _load_tenant(mailbox_upn)
-    url = f"{tenant.base_url}/api/clientv1/CustomerContactsSummary"
+    if not tenant.client_number:
+        logger.error("Brokerware client_number not configured for tenant=%s — "
+                     "cannot fetch contacts (set BROKERWARE[_<KEY>]_CLIENT_NUMBER)", tenant.key)
+        return []
+
+    base = tenant.base_url
+    cnum = tenant.client_number
     contacts: list = []
-    page = 1
-    total_pages = 1
 
     try:
         token = _get_token(tenant)
-        while page <= total_pages:
-            response = requests.get(
-                url,
-                params={"pageSize": page_size, "page": page},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-            contacts.extend(data.get("contacts", []))
-            total_pages = data.get("totalPages", 1) or 1
-            logger.info(
-                "Brokerware contacts page %d/%d fetched (%d records so far) tenant=%s",
-                page, total_pages, len(contacts), tenant.key,
-            )
-            page += 1
+        # 1. List all customers under this client.
+        resp = requests.get(f"{base}/api/client/{cnum}/customer", headers=headers, timeout=30)
+        resp.raise_for_status()
+        customers = resp.json() or []
 
-        logger.info("Fetched %d Brokerware customer contact(s) total tenant=%s",
-                    len(contacts), tenant.key)
+        # 2. Fetch each customer's contacts and flatten to email -> customer rows.
+        for cust in customers:
+            cid = cust.get("id")
+            cname = cust.get("name")
+            if cid is None:
+                continue
+            try:
+                cr = requests.get(f"{base}/api/client/{cnum}/customer/{cid}/contact",
+                                  headers=headers, timeout=30)
+                cr.raise_for_status()
+                body = cr.json()
+            except Exception as e:
+                logger.warning("Contacts fetch failed for customer %s (tenant=%s): %s",
+                               cid, tenant.key, e)
+                continue
+            for ct in (body.get("contacts", []) if isinstance(body, dict) else []):
+                email = (ct.get("email") or "").strip()
+                if email:
+                    contacts.append({
+                        "clientId":     cnum,
+                        "customerId":   cid,
+                        "customerName": cname,
+                        "email":        email,
+                    })
+
+        logger.info("Fetched %d Brokerware contact(s) across %d customer(s) tenant=%s",
+                    len(contacts), len(customers), tenant.key)
         return contacts
 
     except requests.HTTPError as e:
         body = ""
         try:
-            body = e.response.json()
+            body = e.response.text[:200] if e.response else str(e)
         except Exception:
-            body = e.response.text if e.response else str(e)
-        logger.error("Brokerware CustomerContactsSummary HTTP error %s: %s (tenant=%s)",
+            body = str(e)
+        logger.error("Brokerware customer API HTTP error %s: %s (tenant=%s)",
                      getattr(e.response, "status_code", "?"), body, tenant.key)
-        return contacts  # return whatever pages we managed to fetch
-
+        return contacts
     except Exception as e:
-        logger.error("Brokerware CustomerContactsSummary request failed: %s (tenant=%s)",
-                     e, tenant.key)
+        logger.error("Brokerware customer API request failed: %s (tenant=%s)", e, tenant.key)
         return contacts
 
 
@@ -347,14 +378,11 @@ def _get_contacts_cached(mailbox_upn: str = "") -> list:
 
 
 def _to_match(contact: dict) -> dict:
-    """Shape a Brokerware contact into the match dict the pipeline expects.
-
-    (customerName is None — the Brokerware summary endpoint does not return it.)
-    """
+    """Shape a Brokerware contact into the match dict the pipeline expects."""
     email = (contact.get("email") or "").strip()
     return {
         "customerId":   contact.get("customerId"),
-        "customerName": None,
+        "customerName": contact.get("customerName"),
         "email":        email,
         "emailDomain":  email.split("@")[-1].lower() if "@" in email else "",
         "clientId":     contact.get("clientId"),

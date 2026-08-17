@@ -53,6 +53,9 @@ class Config:
     BROKERWARE_BASE_URL: str = os.getenv("BROKERWARE_BASE_URL", "https://shepherd.brokerware.io")
     BROKERWARE_CLIENT_ID: Optional[str] = os.getenv("BROKERWARE_CLIENT_ID")
     BROKERWARE_CLIENT_SECRET: Optional[str] = os.getenv("BROKERWARE_CLIENT_SECRET")
+    # Numeric Brokerware client id used in the REST path (e.g. /api/client/4097939/...).
+    # Distinct from the OAuth BROKERWARE_CLIENT_ID above.
+    BROKERWARE_CLIENT_NUMBER: Optional[str] = os.getenv("BROKERWARE_CLIENT_NUMBER")
 
     # Multi-tenant Brokerware routing: JSON map of lowercase mailbox UPN → tenant key.
     # Tenant key must match the BROKERWARE_<KEY>_* env var prefix (e.g. "shepherd",
