@@ -479,7 +479,10 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
             try:
                 sender_email = email_data.get('from', '')
                 receiver_email = email_data.get('to', '')
-                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=receiver_email)
+                # Use the signed-in mailbox UPN as tenant key — more reliable than
+                # the email's To field, which can be empty or reformatted by Graph API.
+                mailbox_upn = st.session_state.get('graph_user') or receiver_email
+                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=mailbox_upn)
                 matches = search_result["matches"]
                 is_broker = search_result["is_broker_match"]
 
@@ -829,7 +832,8 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
             try:
                 sender_email = email_data.get('from', '')
                 receiver_email = email_data.get('to', '')
-                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=receiver_email)
+                mailbox_upn = st.session_state.get('graph_user') or receiver_email
+                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=mailbox_upn)
                 matches = search_result["matches"]
                 is_broker = search_result["is_broker_match"]
 
