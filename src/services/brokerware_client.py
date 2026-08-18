@@ -102,12 +102,19 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
                                  broker_client_id=broker_client_id,
                                  username=username, password=password)
 
-    # Default / fallback tenant
+    # Default / fallback tenant — used when the receiving mailbox is not in
+    # BROKERWARE_MAILBOX_TENANT_MAP (e.g. manually-uploaded emails whose To: is
+    # not a mapped mailbox). Honor the default BROKERWARE_* env vars for
+    # broker_client_id / username / password so customer contact lookup still
+    # works instead of silently returning zero contacts.
     return _BrokerwareTenant(
         key="default",
         base_url=Config.BROKERWARE_BASE_URL,
         client_id=Config.BROKERWARE_CLIENT_ID or "",
         client_secret=Config.BROKERWARE_CLIENT_SECRET or "",
+        broker_client_id=os.getenv("BROKERWARE_BROKER_CLIENT_ID") or "",
+        username=os.getenv("BROKERWARE_USERNAME") or "",
+        password=os.getenv("BROKERWARE_PASSWORD") or "",
     )
 
 
