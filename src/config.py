@@ -8,10 +8,11 @@ from typing import Optional
 from src.secrets import load_secrets_from_keyvault
 
 # Load environment variables from .env file.
-# override=True makes the project's .env the source of truth even when a
-# variable of the same name already exists in the OS environment (e.g. a stray
-# DATABASE_URL pointing at localhost).
-load_dotenv(override=True)
+# override=False so Azure App Settings (which are OS env vars) always take
+# precedence over the local .env file in production.  In local development
+# the variables are not pre-set in the OS, so .env is still the source of
+# truth.  This mirrors the same pattern used in function_app.py.
+load_dotenv(override=False)
 
 # If KEY_VAULT_URL is configured, pull secrets from Azure Key Vault into the
 # environment (overriding .env). No-op when KEY_VAULT_URL is unset, so local
@@ -53,9 +54,6 @@ class Config:
     BROKERWARE_BASE_URL: str = os.getenv("BROKERWARE_BASE_URL", "https://shepherd.brokerware.io")
     BROKERWARE_CLIENT_ID: Optional[str] = os.getenv("BROKERWARE_CLIENT_ID")
     BROKERWARE_CLIENT_SECRET: Optional[str] = os.getenv("BROKERWARE_CLIENT_SECRET")
-    # Numeric Brokerware client id used in the REST path (e.g. /api/client/4097939/...).
-    # Distinct from the OAuth BROKERWARE_CLIENT_ID above.
-    BROKERWARE_CLIENT_NUMBER: Optional[str] = os.getenv("BROKERWARE_CLIENT_NUMBER")
 
     # Multi-tenant Brokerware routing: JSON map of lowercase mailbox UPN → tenant key.
     # Tenant key must match the BROKERWARE_<KEY>_* env var prefix (e.g. "shepherd",

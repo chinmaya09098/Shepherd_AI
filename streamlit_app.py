@@ -156,7 +156,7 @@ def _get_customer_id(shipment_data: dict) -> Optional[int]:
     return shipment_data.get("customer_id")
 
 
-def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None) -> None:
+def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None, mailbox_upn: str = "") -> None:
     """
     Submit a fully-extracted shipment to Brokerware TMS CreateShipmentAPI.
     Shows success/error feedback in the Streamlit UI.
@@ -180,7 +180,7 @@ def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None)
         return
 
     with st.spinner("Creating shipment in Brokerware TMS..."):
-        result = brokerware_create_shipment(shipment, customer_id=customer_id)
+        result = brokerware_create_shipment(shipment, customer_id=customer_id, mailbox_upn=mailbox_upn)
 
     if result.success:
         shipment_id = result.shipment_id or "N/A"
@@ -295,7 +295,8 @@ def process_email_file(uploaded_file) -> List[Shipment]:
         with st.spinner("Resolving customer ID..."):
             try:
                 _cr = find_customer_matches(
-                    email_data.get('from', ''), email_data.get('to', '')
+                    email_data.get('from', ''), email_data.get('to', ''),
+                    mailbox_upn=email_data.get('to', ''),
                 )
                 _cr_matches = _cr.get("matches", [])
                 resolved_cid: Optional[int] = (
@@ -375,7 +376,7 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                             index=idx,
                             customer_id=resolved_cid,
                         )
-                        _submit_to_brokerware(shipment, customer_id=resolved_cid)
+                        _submit_to_brokerware(shipment, customer_id=resolved_cid, mailbox_upn=email_data.get('to', ''))
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -408,11 +409,11 @@ def process_email_file(uploaded_file) -> List[Shipment]:
                         index=1,
                         customer_id=resolved_cid,
                     )
-                    _submit_to_brokerware(shipment, customer_id=resolved_cid)
+                    _submit_to_brokerware(shipment, customer_id=resolved_cid, mailbox_upn=email_data.get('to', ''))
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
-        
+
         # Cleanup temporary file
         Path(tmp_path).unlink(missing_ok=True)
         
@@ -481,7 +482,10 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
             try:
                 sender_email = email_data.get('from', '')
                 receiver_email = email_data.get('to', '')
-                search_result = find_customer_matches(sender_email, receiver_email)
+                # Use the signed-in mailbox UPN as tenant key — more reliable than
+                # the email's To field, which can be empty or reformatted by Graph API.
+                mailbox_upn = st.session_state.get('graph_user') or receiver_email
+                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=mailbox_upn)
                 matches = search_result["matches"]
                 is_broker = search_result["is_broker_match"]
 
@@ -540,7 +544,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                             index=1,
                             customer_id=resolved_customer_id,
                         )
-                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id, mailbox_upn=mailbox_upn)
                     st.success("Extracted shipment data from email body")
                 else:
                     st.warning("Could not extract shipment data from email body.")
@@ -657,7 +661,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                             index=idx,
                             customer_id=resolved_customer_id,
                         )
-                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id, mailbox_upn=mailbox_upn)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -689,7 +693,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
                         index=1,
                         customer_id=resolved_customer_id,
                     )
-                    _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                    _submit_to_brokerware(shipment, customer_id=resolved_customer_id, mailbox_upn=mailbox_upn)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
@@ -832,7 +836,8 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
             try:
                 sender_email = email_data.get('from', '')
                 receiver_email = email_data.get('to', '')
-                search_result = find_customer_matches(sender_email, receiver_email)
+                mailbox_upn = st.session_state.get('graph_user') or receiver_email
+                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=mailbox_upn)
                 matches = search_result["matches"]
                 is_broker = search_result["is_broker_match"]
 
@@ -847,7 +852,8 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
                 else:
                     resolved_customer_id = None
             except Exception as e:
-                logger.error(f"Customer ID resolution failed: {e}")
+                logger.error(f"Customer ID resolution failed: {e}", exc_info=True)
+                st.warning(f"Brokerware contact lookup error: {e}")
                 resolved_customer_id = None
 
         attachments = email_data.get('attachments', [])
@@ -975,7 +981,7 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
                             customer_id=resolved_customer_id,
                         )
                         if submit_shipments:
-                            _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                            _submit_to_brokerware(shipment, customer_id=resolved_customer_id, mailbox_upn=mailbox_upn)
                 else:
                     st.warning(f"Failed to extract shipment data from {attachment['filename']}")
 
@@ -1004,7 +1010,7 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
                         customer_id=resolved_customer_id,
                     )
                     if submit_shipments:
-                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id)
+                        _submit_to_brokerware(shipment, customer_id=resolved_customer_id, mailbox_upn=mailbox_upn)
                 st.success("Extracted shipment data from email body")
             else:
                 st.warning("Could not extract shipment data from email body. The email may not contain shipment information.")
@@ -1604,7 +1610,7 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                                         "Thread complete — all required fields gathered across the "
                                         "conversation. Creating shipment from the merged thread…"
                                     )
-                                    _submit_to_brokerware(reply_result.shipment, customer_id=_cust)
+                                    _submit_to_brokerware(reply_result.shipment, customer_id=_cust, mailbox_upn=st.session_state.get('graph_user', ''))
                         except Exception as exc:
                             logger.error("Reply merge failed: %s", exc, exc_info=True)
                             st.warning(f"Reply merge encountered an error: {exc}")
@@ -2387,7 +2393,7 @@ def _apply_missing_fields(shipment_idx: int, field_values: dict):
             index=shipment_data["attachment_index"],
             customer_id=cid,
         )
-        _submit_to_brokerware(shipment, customer_id=cid)
+        _submit_to_brokerware(shipment, customer_id=cid, mailbox_upn=st.session_state.get('graph_user', ''))
 
 
 def _display_missing_fields_form(shipment_idx: int):

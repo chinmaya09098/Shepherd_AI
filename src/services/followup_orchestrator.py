@@ -392,6 +392,160 @@ class FollowupOrchestrator:
             message=f"Follow-up #{next_count} sent. Still waiting for: {', '.join(remaining_blocking)}",
         )
 
+    # ── Public API — 24-hour timeout reminder ─────────────────────────────
+
+    async def send_timeout_followup(
+        self,
+        state:        ConversationState,
+        graph_client: GraphClient,
+        access_token: str,
+    ) -> FollowupResult:
+        """
+        Called by the 24-hour timer trigger for conversations in 'awaiting_reply'
+        status where the customer has not responded.
+
+        Sends a reminder follow-up in the same email thread without merging any
+        new reply data. Uses the partial shipment already stored in state to
+        regenerate the follow-up email listing the still-missing fields.
+
+        Returns a FollowupResult with action:
+            followup_sent    — reminder sent successfully
+            max_retries      — follow-up limit already reached; no email sent
+            no_action_needed — conversation is not in awaiting_reply status
+            error            — Graph API send failed or shipment parse error
+        """
+        conv_id = state.conversation_id
+
+        # Guard: only act on conversations genuinely awaiting a reply
+        if state.status != "awaiting_reply":
+            logger.info(
+                "send_timeout_followup: conv=%s status=%s — skipping",
+                conv_id[:20], state.status,
+            )
+            return FollowupResult(
+                action="no_action_needed",
+                conversation_id=conv_id,
+                followup_count=state.followup_count,
+                message=f"Conversation is in status '{state.status}' — no reminder needed.",
+            )
+
+        # Guard: max retries already reached
+        if state.followup_count >= state.max_followups:
+            state.status = "max_retries_reached"
+            state.add_event(
+                EVENT_MAX_RETRIES,
+                {
+                    "reason": "timeout_no_reply",
+                    "followup_count": state.followup_count,
+                    "still_missing": state.missing_fields,
+                },
+            )
+            self._tracker.save(state)
+            self._lifecycle.log(
+                conv_id, EVENT_MAX_RETRIES,
+                {"reason": "timeout_no_reply", "still_missing": state.missing_fields},
+            )
+            logger.warning(
+                "send_timeout_followup: conv=%s hit max follow-ups (%d) — escalating",
+                conv_id[:20], state.max_followups,
+            )
+            return FollowupResult(
+                action="max_retries",
+                missing_fields=state.missing_fields,
+                followup_count=state.followup_count,
+                conversation_id=conv_id,
+                message=f"Maximum of {state.max_followups} follow-up(s) reached. Manual review required.",
+            )
+
+        # Reconstruct partial shipment to derive blocking fields
+        try:
+            partial = Shipment.model_validate(state.partial_shipment)
+        except Exception as exc:
+            logger.error(
+                "send_timeout_followup: conv=%s — failed to reconstruct shipment: %s",
+                conv_id[:20], exc,
+            )
+            return FollowupResult(
+                action="error",
+                conversation_id=conv_id,
+                message=f"Could not reconstruct partial shipment: {exc}",
+            )
+
+        blocking   = self._blocking(state.missing_fields or partial.missing_required_fields)
+        next_count = state.followup_count + 1
+
+        # Generate reminder email
+        followup_html = self._email_gen.generate_followup_email(
+            missing_fields=blocking,
+            shipment=partial,
+            original_subject=state.subject,
+            sender_name=state.sender_name,
+            followup_number=next_count,
+        )
+        state.add_event(
+            EVENT_FOLLOWUP_GENERATED,
+            {"followup_number": next_count, "missing_fields": blocking, "trigger": "timeout"},
+        )
+        self._lifecycle.log(
+            conv_id, EVENT_FOLLOWUP_GENERATED,
+            {"followup_number": next_count, "trigger": "timeout"},
+        )
+
+        # Send reply in the same thread using the last known message ID
+        success = await graph_client.send_reply(
+            access_token=access_token,
+            message_id=state.last_message_id,
+            reply_body=followup_html,
+            reply_html=True,
+        )
+
+        if not success:
+            state.add_event(
+                EVENT_ERROR,
+                {"reason": "graph_reply_failed", "followup_number": next_count},
+            )
+            self._tracker.save(state)
+            self._lifecycle.log(conv_id, EVENT_ERROR, {"reason": "graph_reply_failed"})
+            logger.error(
+                "send_timeout_followup: conv=%s — Graph reply failed for message_id=%s",
+                conv_id[:20], state.last_message_id,
+            )
+            return FollowupResult(
+                action="error",
+                missing_fields=blocking,
+                conversation_id=conv_id,
+                message=f"Failed to send reminder follow-up #{next_count}.",
+            )
+
+        state.followup_count   = next_count
+        state.last_followup_at = datetime.now(timezone.utc).isoformat()
+        state.add_event(
+            EVENT_FOLLOWUP_SENT,
+            {"followup_number": next_count, "missing_fields": blocking, "trigger": "timeout"},
+        )
+        self._tracker.save(state)
+        self._lifecycle.log(
+            conv_id, EVENT_FOLLOWUP_SENT,
+            {"followup_number": next_count, "trigger": "timeout", "missing_fields": blocking},
+        )
+
+        logger.info(
+            "send_timeout_followup: reminder #%d sent for conv=%s — still missing: %s",
+            next_count, conv_id[:20], blocking,
+        )
+        return FollowupResult(
+            action="followup_sent",
+            shipment=partial,
+            missing_fields=blocking,
+            followup_html=followup_html,
+            followup_count=next_count,
+            conversation_id=conv_id,
+            message=(
+                f"Reminder #{next_count} sent to {state.sender_email}. "
+                f"Still waiting for: {', '.join(blocking)}"
+            ),
+        )
+
     # ── UI helpers ────────────────────────────────────────────────────────
 
     def correlate_message(
