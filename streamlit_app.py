@@ -292,7 +292,8 @@ def process_email_file(uploaded_file) -> List[Shipment]:
         with st.spinner("Resolving customer ID..."):
             try:
                 _cr = find_customer_matches(
-                    email_data.get('from', ''), email_data.get('to', '')
+                    email_data.get('from', ''), email_data.get('to', ''),
+                    mailbox_upn=email_data.get('to', ''),
                 )
                 _cr_matches = _cr.get("matches", [])
                 resolved_cid: Optional[int] = (
@@ -478,7 +479,7 @@ def process_email_blob(blob_name: str) -> List[Shipment]:
             try:
                 sender_email = email_data.get('from', '')
                 receiver_email = email_data.get('to', '')
-                search_result = find_customer_matches(sender_email, receiver_email)
+                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=receiver_email)
                 matches = search_result["matches"]
                 is_broker = search_result["is_broker_match"]
 
@@ -828,7 +829,7 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
             try:
                 sender_email = email_data.get('from', '')
                 receiver_email = email_data.get('to', '')
-                search_result = find_customer_matches(sender_email, receiver_email)
+                search_result = find_customer_matches(sender_email, receiver_email, mailbox_upn=receiver_email)
                 matches = search_result["matches"]
                 is_broker = search_result["is_broker_match"]
 

@@ -44,6 +44,28 @@ class _BrokerwareTenant:
     password: str = ""           # for password-grant contact lookup
 
 
+def _extract_email_addresses(raw: str) -> list:
+    """Extract bare email addresses from a raw To/From header value.
+
+    Handles:
+      - Plain address:            "shepherd@3plsystems0.onmicrosoft.com"
+      - Display-name format:      "Shepherd <shepherd@3plsystems0.onmicrosoft.com>"
+      - Semicolon-separated list: "A <a@x.com>; B <b@y.com>"
+    """
+    from email.utils import parseaddr as _parseaddr
+    results = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        _, addr = _parseaddr(part)
+        if addr:
+            results.append(addr.strip().lower())
+        elif part:
+            results.append(part.lower())
+    return results
+
+
 def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
     """Resolve the Brokerware tenant config for a given receiving mailbox UPN.
 
@@ -51,13 +73,21 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
     to obtain a tenant key, then reads BROKERWARE_<KEY>_* env vars for that
     tenant.  Falls back to the legacy BROKERWARE_* vars when no mapping is
     found.
+
+    *mailbox_upn* may be a plain address, a "Name <addr>" string, or a
+    semicolon-separated list of recipients — all forms are handled.
     """
     try:
         tenant_map = _json.loads(Config.BROKERWARE_MAILBOX_TENANT_MAP or "{}")
     except Exception:
         tenant_map = {}
 
-    key = tenant_map.get((mailbox_upn or "").strip().lower(), "")
+    # Try each address extracted from the raw To header until we find a match.
+    key = ""
+    for addr in _extract_email_addresses(mailbox_upn):
+        key = tenant_map.get(addr, "")
+        if key:
+            break
 
     if key:
         prefix = f"BROKERWARE_{key.upper()}_"
