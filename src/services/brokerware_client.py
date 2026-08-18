@@ -352,7 +352,15 @@ def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list
     """
     tenant = _load_tenant(mailbox_upn)
 
-    token = _get_token_password(tenant)
+    try:
+        token = _get_token_password(tenant)
+    except Exception as _tok_err:
+        logger.error(
+            "get_customer_contacts: password-grant token FAILED for tenant=%s url=%s: %s",
+            tenant.key, f"{tenant.base_url}/connect/token", _tok_err, exc_info=True,
+        )
+        return []
+
     if not token:
         logger.warning(
             "get_customer_contacts: no password-grant token for tenant=%s "
@@ -475,7 +483,11 @@ def _get_contacts_cached(mailbox_upn: str = "") -> list:
     tenant = _load_tenant(mailbox_upn)
     cached = _tenant_contacts_cache.get(tenant.key)
     if not cached or (time.time() - cached.get("cached_at", 0)) > _CONTACTS_TTL:
-        fetched = get_customer_contacts(mailbox_upn=mailbox_upn)
+        try:
+            fetched = get_customer_contacts(mailbox_upn=mailbox_upn)
+        except Exception as _ce:
+            logger.error("_get_contacts_cached: unexpected error for tenant=%s: %s", tenant.key, _ce, exc_info=True)
+            fetched = []
         if fetched:
             _tenant_contacts_cache[tenant.key] = {
                 "contacts":  fetched,

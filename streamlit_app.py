@@ -848,7 +848,8 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
                 else:
                     resolved_customer_id = None
             except Exception as e:
-                logger.error(f"Customer ID resolution failed: {e}")
+                logger.error(f"Customer ID resolution failed: {e}", exc_info=True)
+                st.warning(f"Brokerware contact lookup error: {e}")
                 resolved_customer_id = None
 
         attachments = email_data.get('attachments', [])
