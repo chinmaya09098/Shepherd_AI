@@ -352,31 +352,20 @@ def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list
     """
     tenant = _load_tenant(mailbox_upn)
 
-    # Prefer a password-grant token when USERNAME/PASSWORD are configured, but
-    # fall back to the client-credentials token — the /api/client/{id}/customer
-    # and /customer/{id}/contact endpoints work with client-credentials, and we
-    # do not have Brokerware user (password-grant) credentials for every tenant.
-    token = None
     try:
         token = _get_token_password(tenant)
     except Exception as _tok_err:
-        logger.warning(
-            "get_customer_contacts: password-grant token failed for tenant=%s (%s) — "
-            "falling back to client-credentials", tenant.key, _tok_err,
+        logger.error(
+            "get_customer_contacts: password-grant token FAILED for tenant=%s url=%s: %s",
+            tenant.key, f"{tenant.base_url}/connect/token", _tok_err, exc_info=True,
         )
+        return []
 
     if not token:
-        try:
-            token = _get_token(tenant)
-            logger.info("get_customer_contacts: using client-credentials token for tenant=%s",
-                        tenant.key)
-        except Exception as _cc_err:
-            logger.error("get_customer_contacts: client-credentials token FAILED for tenant=%s: %s",
-                         tenant.key, _cc_err, exc_info=True)
-            return []
-
-    if not token:
-        logger.warning("get_customer_contacts: no usable token for tenant=%s", tenant.key)
+        logger.warning(
+            "get_customer_contacts: no password-grant token for tenant=%s "
+            "(USERNAME/PASSWORD not configured)", tenant.key,
+        )
         return []
 
     if not tenant.broker_client_id:

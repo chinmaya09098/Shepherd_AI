@@ -23,12 +23,12 @@ load_secrets_from_keyvault()
 
 class Config:
     """Configuration class for Azure services"""
-
+    
     # Azure Key Vault (optional). When set, secrets are sourced from the vault
     # instead of .env — see src/secrets.py. Example:
     #   KEY_VAULT_URL=https://shepherd-ai-kv.vault.azure.net/
     KEY_VAULT_URL: Optional[str] = os.getenv("KEY_VAULT_URL")
-
+    
     # Azure OpenAI Configuration
     AZURE_OPENAI_ENDPOINT: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
     AZURE_OPENAI_KEY: Optional[str] = os.getenv("AZURE_OPENAI_KEY")
