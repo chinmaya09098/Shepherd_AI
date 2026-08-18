@@ -168,9 +168,6 @@ def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None,
     if shipment.email_type not in ("shipment_tender", "shipment_quote"):
         return
 
-    # Brokerware requires a customerId to create a shipment. When the sender
-    # couldn't be matched to a customer (e.g. broker-forwarded email whose sender
-    # isn't in the contact list), skip creation instead of sending a raw HTTP 400.
     if not customer_id:
         st.warning(
             "Brokerware submission skipped — sender not found in Brokerware contacts. "
@@ -761,7 +758,6 @@ def _store_email_record(email_data: dict, shipments: List[dict], customer_id: Op
             email_data,
             direction="Inbound",
             client_id=customer_id,
-            customer_id=customer_id,
             llm_email_types=llm_email_types,
             extra_metadata=extra,
         )

@@ -388,7 +388,7 @@ Return JSON only:
     def is_shipment_email(self, subject: str, body_preview: str = "", sender: str = "") -> bool:
         """True when classify_email() returns a shipment-related category."""
         return self.classify_email(subject, body_preview, sender) in self.SHIPMENT_EMAIL_TYPES
-
+        
     def _deduplicate_items(self, shipment: Shipment) -> Shipment:
         """If TAG-level items exist, drop summary-level PO/SO line items."""
         items = shipment.required_fields.items

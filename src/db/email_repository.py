@@ -11,8 +11,7 @@ from datetime import datetime
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import TYPE_CHECKING, Optional, Iterable
 
-from sqlalchemy import select, func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import select
 
 from src.db.database import init_db, get_session
 from src.db.models import EmailRecord
@@ -59,45 +58,16 @@ def _parse_received(email_data: dict) -> Optional[datetime]:
 
 
 def store_email_record(**kwargs) -> Optional[str]:
-    """
-    Persist an email row. UPSERT on message_id so this updates the row that
-    upsert_inbox_email() pre-created at inbox load (Phase 1) instead of failing
-    on the unique constraint — that silent failure was why customer_id/class_code
-    never got saved from the Streamlit path.
-
-    On conflict, only non-null incoming values overwrite existing columns, so a
-    later write never wipes data an earlier phase already stored. Returns the row
-    id (str) or None on failure.
-    """
+    """Low-level insert. Returns the new row id as a string, or None on failure."""
     if not init_db():
         logger.debug("DB not configured — skipping email record insert")
         return None
-    message_id = kwargs.get("message_id")
     try:
         with get_session() as session:
-            if not message_id:
-                # No dedup key — plain insert.
-                record = EmailRecord(**kwargs)
-                session.add(record)
-                session.commit()
-                record_id = str(record.id)
-            else:
-                table = EmailRecord.__table__
-                cols = EmailRecord.__mapper__.columns
-                col_values = {cols[k].name: v for k, v in kwargs.items()}
-                stmt = pg_insert(table).values(**col_values)
-                # On conflict, update each provided column — but keep the existing
-                # value when the incoming one is NULL (COALESCE(new, old)).
-                update_set = {
-                    c: func.coalesce(getattr(stmt.excluded, c), getattr(table.c, c))
-                    for c in col_values
-                    if c not in ("id", "message_id", "created_at")
-                }
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["message_id"], set_=update_set
-                ).returning(table.c.id)
-                record_id = str(session.execute(stmt).scalar_one())
-                session.commit()
+            record = EmailRecord(**kwargs)
+            session.add(record)
+            session.commit()
+            record_id = str(record.id)
         logger.info(
             "Stored email record %s (class=%s, type=%s)",
             record_id, kwargs.get("class_code"), kwargs.get("email_type"),
@@ -113,7 +83,6 @@ def record_email(
     *,
     direction: str = "Inbound",
     client_id: Optional[object] = None,
-    customer_id: Optional[int] = None,
     llm_email_types: Optional[Iterable[str]] = None,
     extra_metadata: Optional[dict] = None,
 ) -> Optional[str]:
@@ -123,9 +92,7 @@ def record_email(
     Args:
         email_data:      EMLParser/GraphEmailReader-compatible dict.
         direction:       'Inbound' (received) or 'Outbound' (Shepherd reply).
-        client_id:       resolved customerId (stored as text, legacy column).
-        customer_id:     resolved Brokerware customerId (stored as int) — the value
-                         used to create the shipment.
+        client_id:       resolved Hyperion customerId (stored as text).
         llm_email_types: per-attachment email types from the extractor; used to
                          derive the 'SM' vs 'CM' class for inbound mail.
         extra_metadata:  optional extra context merged into the metadata column.
@@ -145,17 +112,8 @@ def record_email(
     if extra_metadata:
         metadata.update(extra_metadata)
 
-    # Fall back to client_id when customer_id not passed separately (both usually
-    # carry the resolved Brokerware customerId). Coerce to int safely.
-    raw_customer_id = customer_id if customer_id is not None else client_id
-    try:
-        customer_id_int = int(raw_customer_id) if raw_customer_id is not None else None
-    except (TypeError, ValueError):
-        customer_id_int = None
-
     return store_email_record(
         client_id=str(client_id) if client_id is not None else None,
-        customer_id=customer_id_int,
         conversation_id=email_data.get("conversation_id") or None,
         message_id=(
             email_data.get("message_id")
@@ -254,7 +212,6 @@ def update_email_class(
     class_code: str,
     *,
     client_id: Optional[object] = None,
-    customer_id: Optional[int] = None,
     has_missing_fields: bool = False,
     failed: bool = False,
     extra_metadata: Optional[dict] = None,
@@ -294,13 +251,6 @@ def update_email_class(
             record.has_missing_fields = has_missing_fields
             if client_id is not None:
                 record.client_id = str(client_id)
-            # Store the resolved Brokerware customerId (int) — falls back to client_id.
-            raw_cid = customer_id if customer_id is not None else client_id
-            if raw_cid is not None:
-                try:
-                    record.customer_id = int(raw_cid)
-                except (TypeError, ValueError):
-                    pass
             if extra_metadata:
                 merged = dict(record.email_metadata or {})
                 merged.update(extra_metadata)
