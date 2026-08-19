@@ -1,7 +1,7 @@
 """Pydantic schemas for shipment data validation and serialization."""
-from typing import Optional, List
+from typing import Optional, List, Any
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ShipmentAddress(BaseModel):
@@ -27,6 +27,18 @@ class ContactInfo(BaseModel):
     email: Optional[str] = None
 
 
+def _coerce_float(v: Any) -> Optional[float]:
+    """Coerce a value to float; return None when the value is a non-numeric string."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (ValueError, TypeError):
+        return None
+
+
 class ShipmentItem(BaseModel):
     description: Optional[str] = None
     quantity: Optional[float] = None
@@ -35,6 +47,11 @@ class ShipmentItem(BaseModel):
     pieces: Optional[float] = None
     pallets: Optional[float] = None
     dimensions: Optional[str] = None
+
+    @field_validator("pallets", "quantity", "weight", "pieces", mode="before")
+    @classmethod
+    def coerce_numeric(cls, v: Any) -> Optional[float]:
+        return _coerce_float(v)
 
 
 class RequiredFields(BaseModel):

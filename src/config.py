@@ -63,6 +63,13 @@ class Config:
     #    "shepherd2@3plsystems0.onmicrosoft.com": "shepherdwest"}
     BROKERWARE_MAILBOX_TENANT_MAP: str = os.getenv("BROKERWARE_MAILBOX_TENANT_MAP", "{}")
 
+    # Static email → customer ID override map (highest priority in match_customer).
+    # Use this to guarantee a specific sender always resolves to the correct
+    # customerId for each tenant, bypassing the live API lookup.
+    # Format: JSON dict of { "sender@email.com": { "tenant_key": customer_id, ... } }
+    # Example: {"jack3pl@outlook.com": {"shepherd": 4098014, "shepherdwest": 5001}}
+    BROKERWARE_CUSTOMER_EMAIL_MAP: str = os.getenv("BROKERWARE_CUSTOMER_EMAIL_MAP", "{}")
+
     # Azure AI Search
     AZURE_SEARCH_ENDPOINT: Optional[str] = os.getenv("AZURE_SEARCH_ENDPOINT")
     AZURE_SEARCH_KEY: Optional[str] = os.getenv("AZURE_SEARCH_KEY")
