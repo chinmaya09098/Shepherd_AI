@@ -2,7 +2,6 @@
 Streamlit UI for Shepherd AI POC - Email Shipment Extraction
 """
 import streamlit as st
-import streamlit.components.v1 as st_components
 import tempfile
 import json
 import logging
@@ -2155,7 +2154,7 @@ def _render_scrollable_json(json_str: str, height: int = 400) -> None:
         "</style>"
         f"<pre>{safe}</pre>"
     )
-    st_components.html(html, height=height, scrolling=False)
+    st.html(html)
 
 
 def _display_email_preview(email_data: dict):
