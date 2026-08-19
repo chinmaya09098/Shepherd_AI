@@ -2,7 +2,6 @@
 Streamlit UI for Shepherd AI POC - Email Shipment Extraction
 """
 import streamlit as st
-import streamlit.components.v1 as st_components
 import tempfile
 import json
 import logging
@@ -1623,13 +1622,30 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                             _auto_client = _init_graph_client()
                             _auto_token  = st.session_state.graph_token
                             if _auto_client and _auto_token:
+                                # Collect union of missing fields across ALL attachments so
+                                # one follow-up email covers every gap, regardless of how
+                                # many attachments the email had.
+                                _all_missing: list[str] = []
+                                for _sd_check in shipments_data:
+                                    _sh_check = _sd_check["shipment"]
+                                    if _sh_check.email_type in ("shipment_tender", "shipment_quote"):
+                                        for _f in _sh_check.missing_required_fields:
+                                            if _f not in _all_missing:
+                                                _all_missing.append(_f)
+
+                                # Send ONE follow-up for the first eligible shipment only.
+                                _followup_sent_this_email = False
                                 for _idx, _sd in enumerate(shipments_data):
                                     _sh = _sd["shipment"]
                                     if (
                                         _sh.email_type in ("shipment_tender", "shipment_quote")
                                         and _has_blocking_missing_fields(_sh)
                                         and _idx not in st.session_state.followup_results
+                                        and not _followup_sent_this_email
                                     ):
+                                        # Apply merged missing fields so the email asks
+                                        # for everything in one go.
+                                        _sh.missing_required_fields = _all_missing
                                         with st.spinner(
                                             "Missing fields detected — auto-sending follow-up email..."
                                         ):
@@ -1645,6 +1661,7 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                                                     )
                                                 )
                                                 st.session_state.followup_results[_idx] = _result
+                                                _followup_sent_this_email = True
                                             except Exception as _exc:
                                                 logger.error(
                                                     "Auto follow-up failed: %s", _exc, exc_info=True
@@ -2155,7 +2172,7 @@ def _render_scrollable_json(json_str: str, height: int = 400) -> None:
         "</style>"
         f"<pre>{safe}</pre>"
     )
-    st_components.html(html, height=height, scrolling=False)
+    st.html(html)
 
 
 def _display_email_preview(email_data: dict):

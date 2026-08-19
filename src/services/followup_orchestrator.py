@@ -120,6 +120,49 @@ class FollowupOrchestrator:
         ref_ids      = _extract_reference_ids(shipment)
         blocking     = self._blocking(shipment.missing_required_fields)
 
+        # ── Guard: if this conversation already has a terminal state, don't
+        #    overwrite it or send another follow-up. This handles the case
+        #    where the user re-processes the original email after a reply has
+        #    already completed or exhausted the conversation.
+        _existing = self._tracker.load(conv_id)
+        if _existing is not None:
+            if _existing.status == "complete":
+                logger.info(
+                    "handle_initial_extraction: conv=%s already complete — skipping",
+                    conv_id[:20],
+                )
+                return FollowupResult(
+                    action="complete",
+                    shipment=shipment,
+                    missing_fields=[],
+                    conversation_id=conv_id,
+                    message="Conversation already completed via a previous reply.",
+                )
+            if _existing.status == "max_retries_reached":
+                logger.info(
+                    "handle_initial_extraction: conv=%s already at max retries — skipping",
+                    conv_id[:20],
+                )
+                return FollowupResult(
+                    action="max_retries",
+                    missing_fields=_existing.missing_fields,
+                    followup_count=_existing.followup_count,
+                    conversation_id=conv_id,
+                    message="Conversation already reached max follow-ups.",
+                )
+            if _existing.status in ("awaiting_reply",) and _existing.followup_count > 0:
+                logger.info(
+                    "handle_initial_extraction: conv=%s already awaiting reply (followup_count=%d) — skipping",
+                    conv_id[:20], _existing.followup_count,
+                )
+                return FollowupResult(
+                    action="followup_sent",
+                    missing_fields=_existing.missing_fields,
+                    followup_count=_existing.followup_count,
+                    conversation_id=conv_id,
+                    message=f"Follow-up #{_existing.followup_count} already sent for this conversation.",
+                )
+
         # ── Resolve per-customer follow-up limit ──────────────────────────
         from src.config import Config as _Config
         max_followups = _Config.get_max_followups(customer_id)

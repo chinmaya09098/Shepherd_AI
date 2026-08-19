@@ -166,6 +166,8 @@ backend/
 | Azure AD (Entra ID) | OAuth2 app registration (Graph + RBAC) | Tenant: `39f80b2d-...` |
 | Azure Key Vault | Secrets at rest (production) | Optional — set `KEY_VAULT_URL` |
 | Application Insights | Telemetry, structured audit logs | `shepherdai-appinsights` |
+| Azure Firewall | Egress control for VNet-integrated apps | `shepherdai-firewall` |
+| Azure NAT Gateway | Static outbound IP for App subnet | `shepherdai-nat-gateway` (IP: `20.112.81.67`) |
 
 ### Storage Containers
 
@@ -300,6 +302,7 @@ All variables live in `local.settings.json` for local dev, or in Azure Function 
 | Variable | Description |
 |---|---|
 | `BROKERWARE_MAILBOX_TENANT_MAP` | JSON: mailbox UPN → tenant key |
+| `BROKERWARE_CUSTOMER_EMAIL_MAP` | JSON: sender email → `customerId` (static fallback override) |
 | `BROKERWARE_<KEY>_BASE_URL` | TMS base URL per tenant |
 | `BROKERWARE_<KEY>_CLIENT_ID` | OAuth client ID per tenant |
 | `BROKERWARE_<KEY>_CLIENT_SECRET` | OAuth client secret per tenant |
@@ -308,6 +311,11 @@ All variables live in `local.settings.json` for local dev, or in Azure Function 
 | `BROKERWARE_<KEY>_PASSWORD` | TMS password per tenant |
 
 Example tenant keys: `SHEPHERD`, `SHEPHERDWEST`
+
+`BROKERWARE_CUSTOMER_EMAIL_MAP` is a JSON string used as a static fallback when AI Search cannot resolve a customer from the sender email domain. Example:
+```json
+{"orders@acmecargo.com": 12345, "dispatch@fastfreight.com": 67890}
+```
 
 ### PostgreSQL
 
@@ -503,20 +511,23 @@ az functionapp show --name shepherdai-funcapp --resource-group ShepherdAI-Quadra
 ### Deploy Streamlit Web App
 
 ```bash
-# Create deployment zip (from backend/ directory)
-zip -r deploy.zip . \
-  --exclude "*.pyc" \
-  --exclude "__pycache__/*" \
-  --exclude "venv/*" \
-  --exclude ".git/*" \
-  --exclude "output/*" \
-  --exclude "tests/__pycache__/*"
+# Create deployment zip (Python — works on Windows and Linux)
+python -c "
+import zipfile, os, pathlib
+skip = {'.git','venv','__pycache__','output','.pytest_cache'}
+with zipfile.ZipFile('deploy_webapp.zip','w',zipfile.ZIP_DEFLATED) as z:
+    for p in pathlib.Path('.').rglob('*'):
+        if any(s in p.parts for s in skip): continue
+        if p.suffix == '.pyc': continue
+        if p.is_file(): z.write(p)
+print('Done')
+"
 
 # Deploy to App Service
 az webapp deploy \
   --name ShepherdAI-Quad-WebApp \
   --resource-group ShepherdAI-Quadrant-rg \
-  --src-path deploy.zip \
+  --src-path deploy_webapp.zip \
   --type zip \
   --async true
 
@@ -526,6 +537,8 @@ az webapp show --name ShepherdAI-Quad-WebApp --resource-group ShepherdAI-Quadran
 # Tail live logs
 az webapp log tail --name ShepherdAI-Quad-WebApp --resource-group ShepherdAI-Quadrant-rg
 ```
+
+> **Note:** Remove `deploy_webapp.zip` after deployment — it should not be committed to git.
 
 The Web App uses `startup.sh` which runs:
 ```bash
@@ -630,11 +643,14 @@ When required shipment fields are missing after the initial extraction, the syst
 
 ### How It Works
 
-1. **Initial email processed** → `ConversationState` saved to Blob with `status = "awaiting_reply"`, `missing_fields` populated.
-2. **Customer replies** → `process_email` re-runs extraction, merges context, re-attempts field extraction.
-3. **Timer fires** (`send_reminder_followups`) → finds all `awaiting_reply` conversations stale longer than `FOLLOWUP_REMINDER_INTERVAL_MINUTES`.
-4. **`FollowupOrchestrator.send_timeout_followup()`** sends a follow-up reply via `graph_client.send_reply()` in the same email thread.
-5. **Max retries reached** → status changes to `max_retries_reached`, no further follow-ups.
+1. **Initial email processed** → OpenAI extracts fields; `ReplyMerger._compute_missing()` is applied immediately so all missing fields (including ZIP codes) are flagged upfront.
+2. **Single follow-up per email** → Even if an email has multiple attachments (multiple shipment records), the system sends **one** follow-up reply containing the union of missing fields from all attachments. It never sends one reply per attachment.
+3. **`ConversationState` saved** to Blob with `status = "awaiting_reply"`, `missing_fields` populated.
+4. **Re-processing guard** → If the same original email is processed again (e.g. a reply arrives and the inbox poller re-queues it), `handle_initial_extraction` checks existing conversation state first. If state is `complete`, `max_retries_reached`, or `awaiting_reply` with a follow-up already sent, it returns immediately without sending another follow-up or overwriting state.
+5. **Customer replies** → `process_email` re-runs extraction, merges context from prior exchanges, re-attempts field extraction.
+6. **Timer fires** (`send_reminder_followups`) → finds all `awaiting_reply` conversations stale longer than `FOLLOWUP_REMINDER_INTERVAL_MINUTES`.
+7. **`FollowupOrchestrator.send_timeout_followup()`** sends a follow-up reply via `graph_client.send_reply()` in the same email thread.
+8. **Max retries reached** → status changes to `max_retries_reached`, no further follow-ups.
 
 ### Per-Customer Follow-Up Limits
 
@@ -813,6 +829,40 @@ curl https://shepherdai-funcapp.azurewebsites.net/api/health | python -m json.to
 # Force-renew subscriptions (call the timer function manually via APIM)
 # Or wait for the 47-hour timer to fire automatically
 ```
+
+### Azure Firewall Egress Rules
+
+The Web App runs in `snet-app` (`10.0.0.0/24`) with all egress routed through `shepherdai-firewall`. Any new external FQDN the app needs to reach must be explicitly allowed.
+
+To add an egress rule for a new FQDN:
+
+1. Export the current firewall policy rules:
+```bash
+az rest --method GET \
+  --url "https://management.azure.com/subscriptions/<sub-id>/resourceGroups/ShepherdAI-Quadrant-rg/providers/Microsoft.Network/firewallPolicies/shepherdai-firewall-policy/ruleCollectionGroups/DefaultApplicationRuleCollectionGroup?api-version=2023-11-01" \
+  --output json > fw_current.json
+```
+
+2. Edit `fw_current.json` — add a new entry under the `Allow-ShepherdAI-Outbound` rule collection:
+```json
+{
+  "name": "allow-<service>",
+  "ruleType": "ApplicationRule",
+  "sourceAddresses": ["10.0.0.0/24"],
+  "targetFqdns": ["your-service.example.com"],
+  "protocols": [{"protocolType": "Https", "port": 443}],
+  "terminateTLS": false
+}
+```
+
+3. Apply the update:
+```bash
+az rest --method PUT \
+  --url "https://management.azure.com/subscriptions/<sub-id>/resourceGroups/ShepherdAI-Quadrant-rg/providers/Microsoft.Network/firewallPolicies/shepherdai-firewall-policy/ruleCollectionGroups/DefaultApplicationRuleCollectionGroup?api-version=2023-11-01" \
+  --body @fw_update.json
+```
+
+> **Important:** The source must always be `10.0.0.0/24` (the `snet-app` subnet). Using any other CIDR will silently default-deny the traffic — which manifests as an `SSLEOFError` during the TLS handshake.
 
 ---
 

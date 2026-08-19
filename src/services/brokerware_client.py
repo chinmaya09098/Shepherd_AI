@@ -102,11 +102,8 @@ def _load_tenant(mailbox_upn: str = "") -> _BrokerwareTenant:
                                  broker_client_id=broker_client_id,
                                  username=username, password=password)
 
-    # Default / fallback tenant — used when the receiving mailbox is not in
-    # BROKERWARE_MAILBOX_TENANT_MAP (e.g. manually-uploaded emails whose To: is
-    # not a mapped mailbox). Honor the default BROKERWARE_* env vars for
-    # broker_client_id / username / password so customer contact lookup still
-    # works instead of silently returning zero contacts.
+    # Default / fallback tenant — also load broker_client_id + password-grant
+    # creds so contact lookup works even when mailbox UPN is not in the tenant map.
     return _BrokerwareTenant(
         key="default",
         base_url=Config.BROKERWARE_BASE_URL,
@@ -388,7 +385,17 @@ def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list
     try:
         # Step 1 — list all customers for this broker client
         customers_url = f"{tenant.base_url}/api/client/{tenant.broker_client_id}/customer"
+        logger.info(
+            "Brokerware: fetching customer list tenant=%s url=%s",
+            tenant.key, customers_url,
+        )
         cr = requests.get(customers_url, headers=hdrs, timeout=30)
+        logger.info(
+            "Brokerware: customer list response status=%s content-type=%s body_preview=%s",
+            cr.status_code,
+            cr.headers.get("Content-Type", ""),
+            cr.text[:400],
+        )
         cr.raise_for_status()
 
         raw = cr.json()
@@ -417,9 +424,10 @@ def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list
                 # Skip non-JSON responses (Angular SPA catch-all etc.)
                 ct = resp.headers.get("Content-Type", "")
                 if "json" not in ct:
-                    logger.debug(
-                        "Brokerware contacts for customerId=%s returned non-JSON (%s) — skipping",
-                        cust_id, ct,
+                    logger.warning(
+                        "Brokerware contacts for customerId=%s returned non-JSON "
+                        "status=%s content-type=%s body=%s — skipping",
+                        cust_id, resp.status_code, ct, resp.text[:200],
                     )
                     continue
                 resp.raise_for_status()
@@ -428,6 +436,10 @@ def get_customer_contacts(page_size: int = 10000, mailbox_upn: str = "") -> list
                 c_list = (
                     raw_contacts if isinstance(raw_contacts, list)
                     else raw_contacts.get("contacts", [])
+                )
+                logger.info(
+                    "Brokerware: customerId=%s name=%r → %d contact(s) tenant=%s",
+                    cust_id, cust_name, len(c_list), tenant.key,
                 )
                 for c in c_list:
                     email = (c.get("email") or "").strip()
