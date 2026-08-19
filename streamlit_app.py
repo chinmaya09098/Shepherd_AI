@@ -164,7 +164,20 @@ def _submit_to_brokerware(shipment: Shipment, customer_id: Optional[int] = None,
     if not brokerware_is_configured():
         return
 
-    if shipment.email_type not in ("shipment_tender", "shipment_quote"):
+    # Normally only tender/quote emails create shipments. But a customer reply
+    # or correction (often classified as "status_update", e.g. "Sorry, wrong zip
+    # codes …") that carries a COMPLETE shipment — all required fields present —
+    # and resolves to a known customer is a real shipment too, so allow it.
+    # Genuine non-shipment emails (spam) and anything still missing required
+    # fields continue to skip.
+    _is_tender = shipment.email_type in ("shipment_tender", "shipment_quote")
+    _complete_reply = (
+        not _is_tender
+        and shipment.email_type != "spam"
+        and not shipment.missing_required_fields
+        and bool(customer_id)
+    )
+    if not _is_tender and not _complete_reply:
         return
 
     if not customer_id:
@@ -1601,6 +1614,15 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                                         _conv.customer_id if _conv and _conv.customer_id is not None
                                         else _get_customer_id(shipments_data[0])
                                     )
+                                    # A completed thread represents a real tender even when the
+                                    # final reply was classified as a status_update/correction
+                                    # (e.g. "Sorry, wrong zip codes …"). Coerce the merged
+                                    # shipment's email_type so it passes the Brokerware submit
+                                    # guard in _submit_to_brokerware.
+                                    if reply_result.shipment.email_type not in (
+                                        "shipment_tender", "shipment_quote"
+                                    ):
+                                        reply_result.shipment.email_type = "shipment_tender"
                                     st.success(
                                         "Thread complete — all required fields gathered across the "
                                         "conversation. Creating shipment from the merged thread…"
