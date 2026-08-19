@@ -7,6 +7,7 @@ from openai import AzureOpenAI
 from src.config import Config
 from src.models.shipment import Shipment
 from src.utils.logger import get_logger
+from src.extractors.reply_merger import ReplyMerger
 
 logger = get_logger(__name__)
 
@@ -118,6 +119,9 @@ class OpenAIAgent:
             data = json.loads(content)
             shipment = Shipment.model_validate(data)
             shipment = self._deduplicate_items(shipment)
+            # Authoritative missing-field check — catches fields OpenAI
+            # may miss (e.g. ZIP when city/state are present).
+            shipment.missing_required_fields = ReplyMerger._compute_missing(shipment)
 
             logger.info("Successfully extracted shipment data")
             return shipment
@@ -224,7 +228,9 @@ Return only valid JSON."""
             shipments = []
             for item in data.get("shipments", []):
                 try:
-                    shipments.append(Shipment.model_validate(item))
+                    s = Shipment.model_validate(item)
+                    s.missing_required_fields = ReplyMerger._compute_missing(s)
+                    shipments.append(s)
                 except Exception as e:
                     logger.error(f"Failed to parse body shipment: {e}")
             return shipments
