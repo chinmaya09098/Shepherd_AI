@@ -1,6 +1,6 @@
 # Shepherd AI — AI-Powered Shipment Orchestration Platform
 
-An Azure-hosted, event-driven platform that ingests freight emails via Microsoft Graph API, extracts structured shipment data using Azure OpenAI + Document Intelligence, matches customers via Azure AI Search, and creates shipments in the Brokerware TMS — all with automated follow-up and a Streamlit operator dashboard.
+An Azure-hosted, event-driven platform that ingests freight emails via Microsoft Graph API, extracts structured shipment data using Azure OpenAI + Document Intelligence, matches customers via Azure AI Search, and automatically creates shipments in the Brokerware TMS — with intelligent follow-up, multi-mailbox support, human-in-the-loop review, and a Streamlit operator dashboard.
 
 ---
 
@@ -15,12 +15,19 @@ An Azure-hosted, event-driven platform that ingests freight emails via Microsoft
 7. [Running Locally](#running-locally)
 8. [Running Tests](#running-tests)
 9. [Azure Function Triggers](#azure-function-triggers)
-10. [Deployment](#deployment)
-11. [Webhook Registration](#webhook-registration)
-12. [Multi-Tenant Brokerware Setup](#multi-tenant-brokerware-setup)
+10. [Extraction Pipeline](#extraction-pipeline)
+11. [Shipment Creation Logic](#shipment-creation-logic)
+12. [End-to-End Scenarios](#end-to-end-scenarios)
 13. [Follow-Up System](#follow-up-system)
-14. [Security](#security)
-15. [Operational Commands](#operational-commands)
+14. [Conversation State & Thread Tracking](#conversation-state--thread-tracking)
+15. [Multi-Mailbox Support](#multi-mailbox-support)
+16. [Human-in-the-Loop Review Queue](#human-in-the-loop-review-queue)
+17. [Multi-Tenant Brokerware Setup](#multi-tenant-brokerware-setup)
+18. [Customer ID Resolution](#customer-id-resolution)
+18. [Deployment](#deployment)
+19. [Webhook Registration](#webhook-registration)
+20. [Security](#security)
+21. [Operational Commands](#operational-commands)
 
 ---
 
@@ -45,13 +52,13 @@ Microsoft 365 Mailbox(es)
 │                                    ▼                            │
 │  process_email ◄─────────── Queue trigger                       │
 │  │                                                              │
-│  │  1. Fetch full email via Graph API                           │
+│  │  1. Fetch full email + attachments via Graph API             │
 │  │  2. OCR attachments (Azure Content Understanding)            │
-│  │  3. Extract fields (Azure OpenAI — 2-pass)                   │
-│  │  4. Match customer (Azure AI Search RAG)                     │
-│  │  5. Create shipment (Brokerware TMS API)                     │
-│  │  6. Persist ConversationState (Azure Blob)                   │
-│  │  7. Send follow-up reply if fields missing                   │
+│  │  3. Extract structured fields (Azure OpenAI — 2-pass)        │
+│  │  4. Resolve customer (AI Search + Brokerware API + maps)     │
+│  │  5. Create shipment in Brokerware TMS (if fields complete)   │
+│  │  6. Persist ConversationState (Azure Blob Storage)           │
+│  │  7. Send follow-up reply if required fields are missing      │
 │  │                                                              │
 │  send_reminder_followups ── Timer (configurable, default 24h)   │
 │  renew_subscriptions     ── Timer (every 47 hours)              │
@@ -69,8 +76,8 @@ Azure Blob Storage           PostgreSQL (Azure DB)
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │           Streamlit Web App (ShepherdAI-Quad-WebApp)            │
-│  Operator dashboard — review queue, manual processing,          │
-│  conversation history, health monitor                           │
+│  Operator dashboard — process emails, review queue,             │
+│  conversation history, health monitor, manual follow-up         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,48 +90,47 @@ backend/
 ├── function_app.py              # Azure Functions entry point (all triggers)
 ├── streamlit_app.py             # Streamlit operator dashboard
 ├── run_scheduler.py             # Standalone scheduler (non-Azure environments)
-├── startup.sh                  # Web App startup command
-├── host.json                   # Azure Functions host configuration
-├── local.settings.json         # Local dev env vars (never commit secrets)
-├── requirements.txt            # Python dependencies
+├── startup.sh                   # Web App startup command
+├── host.json                    # Azure Functions host configuration
+├── local.settings.json          # Local dev env vars (never commit secrets)
+├── requirements.txt             # Python dependencies
 │
 ├── src/
-│   ├── config.py               # Centralised Config class (reads all env vars)
-│   ├── secrets.py              # Azure Key Vault secret loader
-│   ├── main.py                 # Shared orchestration logic
+│   ├── config.py                # Centralised Config class (reads all env vars)
+│   ├── secrets.py               # Azure Key Vault secret loader
+│   ├── main.py                  # Shared orchestration logic
 │   │
 │   ├── extractors/
-│   │   ├── openai_agent.py     # Azure OpenAI extraction (2-pass)
-│   │   ├── content_understanding.py  # OCR via Document Intelligence
-│   │   └── reply_merger.py     # Merges multi-reply thread context
+│   │   ├── openai_agent.py      # Azure OpenAI extraction (2-pass + Brokerware fallbacks)
+│   │   ├── content_understanding.py   # OCR via Azure Document Intelligence
+│   │   └── reply_merger.py      # Merges reply thread context; computes missing fields
 │   │
 │   ├── models/
-│   │   ├── shipment.py         # Pydantic: Shipment, ShipmentItem
-│   │   ├── client_format.py    # Serialize Shipment → Brokerware API JSON
-│   │   ├── conversation_state.py  # ConversationState blob model
-│   │   ├── graph_models.py     # GraphConfig, GraphMessage
-│   │   └── review_request.py   # HITL review queue model
+│   │   ├── shipment.py          # Pydantic: Shipment, RequiredFields, ShipmentItem
+│   │   ├── client_format.py     # Serialize Shipment → Brokerware API JSON payload
+│   │   ├── conversation_state.py  # ConversationState blob model + lifecycle events
+│   │   ├── graph_models.py      # MailMessage, GraphConfig
+│   │   └── review_request.py    # HITL ReviewRequest model
 │   │
 │   ├── services/
-│   │   ├── graph_client.py         # Microsoft Graph API client
-│   │   ├── brokerware_client.py    # Brokerware TMS API client (multi-tenant)
-│   │   ├── search_client.py        # Azure AI Search (customer matching)
-│   │   ├── context_search_client.py  # RAG context retrieval
-│   │   ├── conversation_tracker.py   # Load/save ConversationState blobs
-│   │   ├── followup_orchestrator.py  # Follow-up email logic
-│   │   ├── followup_email_generator.py  # Follow-up email HTML generator
+│   │   ├── graph_client.py              # Microsoft Graph API client
+│   │   ├── brokerware_client.py         # Brokerware TMS API (multi-tenant)
+│   │   ├── search_client.py             # Azure AI Search — customer matching
+│   │   ├── context_search_client.py     # RAG context retrieval
+│   │   ├── conversation_tracker.py      # Load/save ConversationState blobs; mailbox-scoped list_active()
+│   │   ├── followup_orchestrator.py     # Follow-up logic; handle_initial_extraction / handle_reply
+│   │   ├── followup_email_generator.py  # Follow-up email HTML generation
 │   │   ├── webhook_subscription_manager.py  # Graph subscription lifecycle
-│   │   ├── health_monitor.py       # System health checks + alerting
-│   │   ├── hitl_router.py          # Human-in-the-loop review routing
-│   │   ├── review_queue.py         # Review queue (Blob-backed)
-│   │   ├── scheduler.py            # APScheduler jobs
-│   │   └── hyperion_client.py      # Hyperion TMS (legacy)
+│   │   ├── health_monitor.py            # System health checks + alerting
+│   │   ├── hitl_router.py               # HITL routing triggers and decisions
+│   │   ├── review_queue.py              # Review queue (Blob-backed)
+│   │   └── scheduler.py                 # APScheduler jobs
 │   │
 │   ├── db/
 │   │   ├── database.py             # SQLAlchemy engine + session factory
 │   │   ├── models.py               # ORM models: EmailRecord, CustomerRetryConfig
 │   │   ├── email_repository.py     # DB writes for email audit log
-│   │   └── retry_config_repository.py  # Per-customer retry limit lookup
+│   │   └── retry_config_repository.py   # Per-customer retry limit lookup
 │   │
 │   ├── security/
 │   │   ├── apim_guard.py           # APIM subscription key validation
@@ -137,7 +143,7 @@ backend/
 │   └── utils/                      # Logger and shared utilities
 │
 ├── scripts/
-│   └── test_reminder.py        # Manual follow-up reminder test runner
+│   └── test_reminder.py         # Manual follow-up reminder test runner
 │
 └── tests/
     ├── test_timeout_followup.py
@@ -173,15 +179,15 @@ backend/
 
 | Container | Purpose |
 |---|---|
-| `sample-mails` | Incoming `.eml` files |
+| `sample-mails` | Incoming `.eml` files (blob-tab processing) |
 | `output-json` | Extracted shipment JSON output |
-| `processed-logs` | ConversationState blobs + dedup markers |
+| `processed-logs` | ConversationState blobs, dedup markers, HITL review queue |
 
 ### Storage Queue
 
 | Queue | Purpose |
 |---|---|
-| `email-notifications` | Decouples webhook → processor |
+| `email-notifications` | Decouples Graph webhook → email processor |
 
 ### PostgreSQL Tables
 
@@ -243,7 +249,7 @@ cp local.settings.json.example local.settings.json
 
 ## Environment Variables
 
-All variables live in `local.settings.json` for local dev, or in Azure Function App / App Service **Configuration > Application settings** for production. In production, sensitive values should be stored in **Azure Key Vault** (set `KEY_VAULT_URL`).
+All variables live in `local.settings.json` for local dev, or in Azure Function App / App Service **Configuration > Application settings** for production. Sensitive values should be stored in **Azure Key Vault** (set `KEY_VAULT_URL`).
 
 ### Azure OpenAI
 
@@ -302,7 +308,7 @@ All variables live in `local.settings.json` for local dev, or in Azure Function 
 | Variable | Description |
 |---|---|
 | `BROKERWARE_MAILBOX_TENANT_MAP` | JSON: mailbox UPN → tenant key |
-| `BROKERWARE_CUSTOMER_EMAIL_MAP` | JSON: sender email → `customerId` (static fallback override) |
+| `BROKERWARE_CUSTOMER_EMAIL_MAP` | JSON: sender email → per-tenant `customerId` map (static override) |
 | `BROKERWARE_<KEY>_BASE_URL` | TMS base URL per tenant |
 | `BROKERWARE_<KEY>_CLIENT_ID` | OAuth client ID per tenant |
 | `BROKERWARE_<KEY>_CLIENT_SECRET` | OAuth client secret per tenant |
@@ -312,10 +318,17 @@ All variables live in `local.settings.json` for local dev, or in Azure Function 
 
 Example tenant keys: `SHEPHERD`, `SHEPHERDWEST`
 
-`BROKERWARE_CUSTOMER_EMAIL_MAP` is a JSON string used as a static fallback when AI Search cannot resolve a customer from the sender email domain. Example:
+`BROKERWARE_CUSTOMER_EMAIL_MAP` maps sender emails to a per-tenant `customerId`. It is checked **before** the live Brokerware API and takes highest priority. Format:
+
 ```json
-{"orders@acmecargo.com": 12345, "dispatch@fastfreight.com": 67890}
+{
+  "jack3pl@outlook.com":      {"shepherd": 4098014, "shepherdwest": 5001},
+  "orders@acmecargo.com":     {"shepherd": 12345},
+  "dispatch@fastfreight.com": {"shepherd": 67890}
+}
 ```
+
+> The outer key is the sender email (case-insensitive). The inner key is the Brokerware tenant key (lowercase). The value is the `customerId` integer.
 
 ### PostgreSQL
 
@@ -383,7 +396,7 @@ npm install -g azure-functions-core-tools@4 --unsafe-perm true
 # Start the Function App locally
 func start
 
-# The following triggers are available at http://localhost:7071:
+# Available at http://localhost:7071:
 #   GET/POST  http://localhost:7071/api/graph_webhook
 #   POST      http://localhost:7071/api/register_webhooks?code=<host-key>
 #   GET       http://localhost:7071/api/health
@@ -392,13 +405,10 @@ func start
 ### Option 2 — Streamlit UI only
 
 ```bash
-# Activate virtual environment first
 venv\Scripts\activate         # Windows
 source venv/bin/activate      # macOS / Linux
 
-# Run Streamlit dashboard
 streamlit run streamlit_app.py
-
 # Access at http://localhost:8501
 ```
 
@@ -422,10 +432,10 @@ python -m pytest tests/ -v
 # Run a specific test file
 python -m pytest tests/test_timeout_followup.py -v
 
-# Run with coverage report
+# Run with coverage
 python -m pytest tests/ --cov=src --cov-report=term-missing
 
-# Run the manual reminder test script
+# Manual reminder test script
 python scripts/test_reminder.py --list
 python scripts/test_reminder.py --dry-run
 python scripts/test_reminder.py --send
@@ -459,26 +469,19 @@ python scripts/test_reminder.py --send --conv-id <conversation_id>
 | `register_webhooks` | HTTP | `POST /api/register_webhooks` | Function key |
 | `health` | HTTP | `GET /api/health` | Anonymous |
 
-### Function descriptions
+### Function Descriptions
 
-**`graph_webhook`** — Microsoft Graph sends change notifications here when new emails arrive.
-- `GET`: Returns `validationToken` query param for subscription handshake.
+**`graph_webhook`** — Receives Microsoft Graph change notifications when new emails arrive.
+- `GET`: Returns `validationToken` for subscription handshake.
 - `POST`: Validates `clientState`, checks for dedup marker, enqueues `message_id` to `email-notifications`.
 
-**`process_email`** — Core pipeline. Dequeues a message ID and runs:
-1. Fetch full email + attachments via Graph API
-2. OCR attachments with Azure Content Understanding
-3. 2-pass extraction with Azure OpenAI
-4. Customer lookup via Azure AI Search (vector) + Brokerware API
-5. Create shipment in Brokerware TMS
-6. Persist `ConversationState` to Blob Storage
-7. Send follow-up reply email if required fields are missing
+**`process_email`** — Core pipeline. Dequeues a message ID and runs the full extraction, customer resolution, Brokerware submission, and follow-up flow.
 
-**`send_reminder_followups`** — Finds all `awaiting_reply` conversations stale beyond the threshold and sends another reminder reply in the original email thread.
+**`send_reminder_followups`** — Finds all `awaiting_reply` conversations stale beyond the threshold and sends another follow-up reply in the original email thread.
 
 **`renew_subscriptions`** — Renews Graph API subscriptions (max 72-hour lifetime) before they expire.
 
-**`poll_inbox_fallback`** — Polls inbox every 2 minutes as a fallback against dropped webhook notifications. Uses a checkpoint blob to track the last-polled timestamp.
+**`poll_inbox_fallback`** — Polls inbox every 2 minutes as a fallback against dropped webhook notifications.
 
 **`register_webhooks`** — One-shot admin endpoint to create Graph subscriptions for all configured mailboxes.
 
@@ -486,134 +489,473 @@ python scripts/test_reminder.py --send --conv-id <conversation_id>
 
 ---
 
-## Deployment
+## Extraction Pipeline
 
-### Prerequisites
+### Supported Document Types
 
-```bash
-# Login to Azure
-az login
+| Document | Key Data Extracted |
+|---|---|
+| Bill of Lading (BOL) | Pickup/drop locations, shipment ID, items, carrier |
+| Rate Confirmation | Load details, pickup/delivery dates, equipment, weight |
+| Picking List | Line items, delivery date, shipper info |
+| Sales Order | Order number, PO number, items, ship-via (equipment mode) |
+| Brokerware-format JSON | All shipment fields including `shipperZip`, `consigneeZip`, `customerId` |
+| Email body | Routing context, reference numbers, contacts, pickup date |
 
-# Set active subscription (if needed)
-az account set --subscription "<subscription-id-or-name>"
+### 2-Pass Extraction Flow
+
+```
+Email body + all attachment text
+         │
+         ▼  Pass 1 — Envelope Extraction
+Azure OpenAI
+  → pickup / drop locations and dates
+  → equipment type and mode
+  → reference numbers
+  → customer context
+         │
+         ├──────────────────────────────────────────────┐
+         │                                              │
+         ▼  Pass 2 — Detailed Shipment (per attachment) │
+Azure OpenAI (per attachment + envelope as read-only)   │
+  → line items (pieces, weight, description)            │
+  → shipper / consignee address details                 │
+  → special instructions                                │
+         │                                              │
+         ▼  Brokerware ZIP Fallback                     │
+_apply_brokerware_fallback()                            │
+  → parses Brokerware-format JSON from raw text         │
+  → fills pickup zip_code from shipperZip if null       │
+  → fills drop zip_code from consigneeZip if null       │
+  → re-runs _compute_missing() after filling            │
+         │                                              │
+         ▼  Missing Field Validation                    │
+ReplyMerger._compute_missing()                         ◄┘
+  → checks all blocking required fields
+  → populates missing_required_fields list
+         │
+         ▼
+Customer ID Resolution (see next section)
+         │
+         ▼
+Brokerware TMS
+  → Create shipment if all required fields present
+  → Return shipment ID
 ```
 
-### Deploy Function App
+### Required Fields
 
-```bash
-# From the backend/ directory
-func azure functionapp publish shepherdai-funcapp --python
+All of the following must be present to create a Brokerware shipment:
 
-# Verify deployment
-az functionapp show --name shepherdai-funcapp --resource-group ShepherdAI-Quadrant-rg --query "state" -o tsv
-```
-
-### Deploy Streamlit Web App
-
-```bash
-# Create deployment zip (Python — works on Windows and Linux)
-python -c "
-import zipfile, os, pathlib
-skip = {'.git','venv','__pycache__','output','.pytest_cache'}
-with zipfile.ZipFile('deploy_webapp.zip','w',zipfile.ZIP_DEFLATED) as z:
-    for p in pathlib.Path('.').rglob('*'):
-        if any(s in p.parts for s in skip): continue
-        if p.suffix == '.pyc': continue
-        if p.is_file(): z.write(p)
-print('Done')
-"
-
-# Deploy to App Service
-az webapp deploy \
-  --name ShepherdAI-Quad-WebApp \
-  --resource-group ShepherdAI-Quadrant-rg \
-  --src-path deploy_webapp.zip \
-  --type zip \
-  --async true
-
-# Verify deployment
-az webapp show --name ShepherdAI-Quad-WebApp --resource-group ShepherdAI-Quadrant-rg --query "state" -o tsv
-
-# Tail live logs
-az webapp log tail --name ShepherdAI-Quad-WebApp --resource-group ShepherdAI-Quadrant-rg
-```
-
-> **Note:** Remove `deploy_webapp.zip` after deployment — it should not be committed to git.
-
-The Web App uses `startup.sh` which runs:
-```bash
-python -m streamlit run streamlit_app.py --server.port 8000 --server.address 0.0.0.0
-```
-
-### Configure App Settings (Production)
-
-```bash
-# Function App — set all environment variables
-az functionapp config appsettings set \
-  --name shepherdai-funcapp \
-  --resource-group ShepherdAI-Quadrant-rg \
-  --settings \
-    AZURE_OPENAI_ENDPOINT="https://shepherdai-quadrant-openai.openai.azure.com/" \
-    AZURE_OPENAI_DEPLOYMENT="gpt-5-chat" \
-    AZURE_OPENAI_API_VERSION="2024-02-15-preview" \
-    AZURE_OPENAI_EMBEDDING_DEPLOYMENT="text-embedding-3-small" \
-    AZURE_SEARCH_INDEX_NAME="customer-contacts" \
-    GRAPH_WEBHOOK_NOTIFICATION_URL="https://shepherdai-apim.azure-api.net/functions/graph_webhook" \
-    GRAPH_WEBHOOK_CLIENT_STATE="shepherd-ai-webhook" \
-    FOLLOWUP_TIMER_SCHEDULE="0 0 */24 * * *" \
-    FOLLOWUP_REMINDER_INTERVAL_MINUTES="1440" \
-    FOLLOWUP_DEFAULT_MAX="3" \
-    APIM_STRICT_ENFORCEMENT="true"
-
-# Web App — set environment variables
-az webapp config appsettings set \
-  --name ShepherdAI-Quad-WebApp \
-  --resource-group ShepherdAI-Quadrant-rg \
-  --settings \
-    WEBSITES_PORT="8000" \
-    AZURE_OPENAI_DEPLOYMENT="gpt-5-chat"
-```
+| Field | Notes |
+|---|---|
+| `customerName` | The freight customer name |
+| `pickupLocation.address` | Full address including zip code |
+| `dropLocation.address` | Full address including zip code |
+| `pickupDate` | ISO date string |
+| `equipmentMode` | e.g. Flatbed, Dry Van, Reefer |
+| `items` | At least one shipment item (warning-only — won't block submission) |
 
 ---
 
-## Webhook Registration
+## Shipment Creation Logic
 
-After deploying the Function App for the first time (or after rotating secrets), register Graph subscriptions for all configured mailboxes:
+The core rule is simple: **if all required fields are present, create the shipment immediately. If any are missing, send a follow-up email.**
 
-```bash
-# Get the Function App host key
-FUNC_KEY=$(az functionapp keys list \
-  --name shepherdai-funcapp \
-  --resource-group ShepherdAI-Quadrant-rg \
-  --query "functionKeys.default" -o tsv)
+### Decision Flow
 
-# Register webhooks
-curl -X POST \
-  "https://shepherdai-funcapp.azurewebsites.net/api/register_webhooks?code=${FUNC_KEY}" \
-  -H "Content-Type: application/json"
+```
+Email received
+      │
+      ▼
+Is it a tracked customer reply?
+      │
+   YES ──► handle_reply()
+      │         │
+      │         ├── All fields now complete? ──► Submit to Brokerware ✅
+      │         └── Still missing fields?    ──► Send next follow-up 📧
+      │
+   NO ──► Extract from email body / attachments
+              │
+              ├── All required fields present?
+              │         ├── YES ──► Submit to Brokerware immediately ✅
+              │         └── NO  ──► Send follow-up email 📧
+              │                     Save ConversationState = "awaiting_reply"
+              │
+              └── Conversation already "complete" in blob?
+                        └── YES ──► Load merged shipment from blob
+                                    Submit to Brokerware ✅
 ```
 
-The function creates one Graph subscription per mailbox listed in `GRAPH_MAILBOX_USER_IDS`. Subscriptions expire after 72 hours and are renewed automatically by the `renew_subscriptions` timer trigger.
+### What "All Fields Present" Means
+
+`ReplyMerger._compute_missing()` checks the required fields listed above. Fields returned in `missing_required_fields` that are not marked `warning_only` are **blocking** — shipment creation is skipped until they are filled. The `items` field is `warning_only` (submission proceeds even without line items).
+
+---
+
+## End-to-End Scenarios
+
+These are the real-world scenarios the system handles, with what the operator sees in the Streamlit dashboard.
+
+---
+
+### Scenario 1 — Fresh email, all fields present
+
+**Example:** Forwarded rate confirmation with attachment. Sender is in Brokerware contacts.
+
+| Step | What happens |
+|---|---|
+| Email arrives | Graph webhook fires, message queued |
+| OCR + extraction | All required fields extracted (pickup, drop, ZIP, date, equipment) |
+| Customer lookup | Sender email matched → `customerId` resolved |
+| Result | `Shipment created in Brokerware TMS — ID: 10014` |
+
+**Dashboard:** Shows green "Shipment created" banner with Brokerware ID. No follow-up sent.
+
+---
+
+### Scenario 2 — Fresh email, missing fields
+
+**Example:** Email body only, no attachment. Pickup ZIP code missing.
+
+| Step | What happens |
+|---|---|
+| Email arrives | Graph webhook fires, message queued |
+| Extraction | Pickup ZIP not found in email body |
+| `_compute_missing()` | Flags `shipperZip` as missing (blocking) |
+| Auto follow-up | System sends reply to sender: "Please provide: Pickup ZIP code" |
+| Conversation saved | `status = "awaiting_reply"`, `mailbox_user_id` set |
+
+**Dashboard:** Shows "Follow-up email #1 sent successfully. Waiting for customer reply."
+
+---
+
+### Scenario 3 — Customer replies with missing information
+
+**Example:** Customer sends reply: "Zip is 77077"
+
+| Step | What happens |
+|---|---|
+| Reply arrives | Correlated to original thread via `conversationId` |
+| `handle_reply()` | Merges reply data into existing partial shipment |
+| `_compute_missing()` | No blocking fields remaining |
+| Result | `Shipment created in Brokerware TMS — ID: 10015` |
+| Conversation saved | `status = "complete"` |
+
+**Dashboard:** Shows "Thread complete — all required fields gathered across the conversation. Creating shipment from the merged thread…" then Brokerware ID.
+
+---
+
+### Scenario 4 — Customer replies but fields still missing
+
+**Example:** Customer replies but forgets to include delivery date.
+
+| Step | What happens |
+|---|---|
+| Reply arrives | Merged into partial shipment |
+| `_compute_missing()` | `deliveryDate` still missing |
+| Auto follow-up | System sends follow-up #2: "Please also provide: Delivery date" |
+| Conversation saved | `followup_count` incremented, still `awaiting_reply` |
+
+**Dashboard:** Shows "Follow-up email #2 sent successfully."
+
+---
+
+### Scenario 5 — Email contains Brokerware-format JSON (Jack's scenario)
+
+**Example:** Sender forwards a Brokerware JSON payload in the email body:
+```json
+{
+  "customerId": 4098014,
+  "shipperZip": "77077",
+  "consigneeZip": "78626",
+  "shipmentStatus": "Booked",
+  ...
+}
+```
+
+| Step | What happens |
+|---|---|
+| Sender not in contacts | `find_customer_matches()` returns no match |
+| Brokerware JSON fallback | Body parsed → `customerId = 4098014` extracted |
+| ZIP fallback | `shipperZip` → `pickup.address.zip_code = "77077"` |
+| ZIP fallback | `consigneeZip` → `drop.address.zip_code = "78626"` |
+| Result | `Shipment created in Brokerware TMS — ID: <id>` |
+
+**Dashboard:** Shows "Customer ID resolved from Brokerware JSON in email body: `4098014`" then Brokerware ID.
+
+> To avoid relying on the body fallback, add the sender to `BROKERWARE_CUSTOMER_EMAIL_MAP`:
+> ```json
+> {"jack3pl@outlook.com": {"shepherd": 4098014}}
+> ```
+
+---
+
+### Scenario 6 — Sender not in Brokerware contacts, no JSON fallback
+
+**Example:** New customer emails in for a shipment. Sender domain not indexed in AI Search.
+
+| Step | What happens |
+|---|---|
+| Customer lookup | Static map: no match. Live API: no match. JSON fallback: no `customerId` in body |
+| HITL trigger | `no_customer_match` → routed to Review Queue |
+| Operator action | Opens Review Queue, enters Brokerware Customer ID, clicks Approve |
+| Result | `Shipment created in Brokerware TMS — ID: <id>` |
+
+**Dashboard (Review Queue):** Shows routing reason "Customer could not be matched", editable fields form, **Brokerware Customer ID** input, Approve / Reject buttons.
+
+> After approving, add the sender to `BROKERWARE_CUSTOMER_EMAIL_MAP` so future emails from them are auto-resolved.
+
+---
+
+### Scenario 7 — Max follow-ups reached, no response
+
+**Example:** System sent 3 follow-up emails. Customer never replied.
+
+| Step | What happens |
+|---|---|
+| After follow-up #3 | `followup_count >= max_followups` |
+| Status updated | `status = "max_retries_reached"` |
+| HITL trigger | `max_retries` → routed to Review Queue |
+| Operator action | Reviews extracted data, fills any missing fields, clicks Approve |
+| Result | Shipment created or rejected |
+
+**Dashboard:** Shows "Maximum follow-ups reached (3). This shipment requires human review." with "Route to Review Queue" button.
+
+---
+
+### Scenario 8 — Same email re-processed (conversation already complete)
+
+**Example:** Operator processes an email that was already completed in a previous session. Conversation blob has `status = "complete"`.
+
+| Step | What happens |
+|---|---|
+| Correlation | `get_active_state()` returns `None` (not "awaiting_reply") |
+| Fresh email path | `submit_shipments = True` |
+| If all fields extracted | Normal submission at `process_graph_email` |
+| If LLM misses fields | Auto-followup loop calls `handle_initial_extraction` → early-return `action = "complete"` |
+| Fallback | Loads merged shipment from blob (`_cs.partial_shipment`) → submits to Brokerware |
+
+**Dashboard:** Shows "Conversation already complete — submitting merged shipment to Brokerware TMS…" then Brokerware ID.
+
+---
+
+### Scenario 9 — Two mailboxes, same sender sends multiple different loads
+
+**Example:** `jack3pl@outlook.com` sends "CertainTeed Jonesburg" email to mailbox A, then sends "Nucor Yamato" email to mailbox B. Mailbox A is awaiting a reply for the Jonesburg thread.
+
+**Without mailbox scoping (old behavior):**
+- "Nucor Yamato" email correlated to the Jonesburg thread (60% sender confidence)
+- Follow-up #2 sent to wrong thread
+- Nucor Yamato's content never independently extracted → FAIL
+
+**With mailbox scoping (current behavior):**
+- Jonesburg thread has `mailbox_user_id = "mailboxA@domain.com"`
+- `list_active(mailbox_upn="mailboxB@domain.com")` excludes Jonesburg thread
+- Nucor Yamato email starts its own fresh conversation on mailbox B → PASS
+
+**Key config:** `GRAPH_MAILBOX_USER_IDS` must list all mailbox UPNs. Each conversation stores its originating `mailbox_user_id` at creation time.
+
+---
+
+### Scenario 10 — HITL approve with customer ID for no-match
+
+**Example:** "Wire Mesh Sales Jacksonville, FL" emails in. Not in contacts.
+
+| Step | What happens |
+|---|---|
+| No match | Routed to Review Queue with `no_customer_match` |
+| Operator opens queue | Sees "Customer could not be matched" flag |
+| Operator enters | `Customer ID: 4098021` in the number input |
+| Approve clicked | `_submit_to_brokerware(shipment, customer_id=4098021)` |
+| Result | `Shipment created in Brokerware TMS — ID: 10021` |
+
+---
+
+## Follow-Up System
+
+When required fields are missing, the system automatically sends a follow-up reply in the original email thread asking the customer to provide the missing information.
+
+### How It Works
+
+1. **Initial extraction** → `_compute_missing()` flags all missing fields upfront (including ZIP codes via the Brokerware ZIP fallback).
+
+2. **Single follow-up per email** → Even if an email has multiple attachments, the system sends **one** follow-up reply containing the union of all missing fields across every attachment. It never sends one reply per attachment.
+
+3. **`ConversationState` saved** to Blob with `status = "awaiting_reply"`, `missing_fields` list, and `mailbox_user_id` (for mailbox scoping).
+
+4. **Re-processing guard** → If the same original email is re-queued (e.g. the inbox poller picks it up again), `handle_initial_extraction` checks the existing state first:
+   - Status `complete` → skip, submit merged shipment from blob.
+   - Status `awaiting_reply` with followup already sent → skip, show existing status.
+   - Status `max_retries_reached` → skip, show error.
+
+5. **Customer replies** → Incoming reply is correlated to the original thread by conversation ID, reference IDs, subject similarity, or sender. The reply data is merged into the existing partial shipment. If all fields are now present, the shipment is submitted to Brokerware.
+
+6. **Reminder timer** (`send_reminder_followups`) → Fires on `FOLLOWUP_TIMER_SCHEDULE`. Finds all `awaiting_reply` conversations stale longer than `FOLLOWUP_REMINDER_INTERVAL_MINUTES` and sends another follow-up reply.
+
+7. **Max retries** → When `followup_count >= max_followups`, status changes to `max_retries_reached` and the conversation is routed to the HITL Review Queue.
+
+### Per-Customer Follow-Up Limits
+
+Limits are resolved in priority order:
+
+1. `customer_retry_config` table in PostgreSQL (per `customerId`)
+2. `FOLLOWUP_MAX_BY_CUSTOMER` env var JSON: `{"customerId": maxCount}`
+3. `FOLLOWUP_DEFAULT_MAX` global default (default: `3`)
+
+---
+
+## Conversation State & Thread Tracking
+
+Every email thread the system sends a follow-up for has a `ConversationState` blob saved to `processed-logs/conversations/<conversation_id>.json`.
+
+### ConversationState Fields
+
+| Field | Description |
+|---|---|
+| `conversation_id` | Graph `conversationId` of the email thread |
+| `status` | `processing` → `awaiting_reply` → `complete` \| `max_retries_reached` |
+| `partial_shipment` | The current best-merged Shipment (updated after each reply) |
+| `missing_fields` | List of field names still missing |
+| `followup_count` | Number of follow-up emails sent so far |
+| `max_followups` | Limit for this conversation (from per-customer config) |
+| `customer_id` | Resolved Brokerware `customerId` (set at conversation creation) |
+| `mailbox_user_id` | The mailbox UPN that received the original email (mailbox scoping) |
+| `sender_email` | Original sender |
+| `subject` | Original email subject |
+
+### Lifecycle Events
+
+Events are appended to `ConversationState.events` for full audit traceability:
+
+- `email_classified` — email type identified (tender, quote, spam)
+- `extraction_complete` — OpenAI extraction finished
+- `customer_id_resolved` — Brokerware customer resolved
+- `followup_generated` — follow-up email body generated
+- `followup_sent` — follow-up reply sent via Graph
+- `data_merged` — customer reply merged into partial shipment
+- `validation_passed` — all required fields now present
+- `conversation_complete` — shipment ready / submitted
+- `max_retries_reached` — follow-up limit hit
+
+### Reply Correlation Strategies (in priority order)
+
+1. **Conversation ID** — exact match on Graph `conversationId`
+2. **Reference ID** — load/PO/BOL number referenced in both emails
+3. **Subject similarity** — normalized subject line fuzzy match
+4. **Sender + subject** — same sender email + similar subject
+
+Only conversations with `status == "awaiting_reply"` and matching `mailbox_user_id` are candidates for correlation (see [Multi-Mailbox Support](#multi-mailbox-support)).
+
+---
+
+## Multi-Mailbox Support
+
+Shepherd AI supports multiple Microsoft 365 mailboxes simultaneously. Each mailbox is independently tracked so that follow-up conversations from one mailbox never interfere with another.
+
+### Configuration
+
+```bash
+# Comma-separated list of mailbox UPNs to monitor
+GRAPH_MAILBOX_USER_IDS=shepherd@3plsystems0.onmicrosoft.com,shepherd2@3plsystems0.onmicrosoft.com
+```
+
+### Mailbox Scoping
+
+When a `ConversationState` is created, the `mailbox_user_id` field is set to the UPN of the mailbox that received the original email. When `list_active()` is called during reply correlation, it filters to only return conversations from the **same mailbox**:
+
+- Conversations with a known `mailbox_user_id` that **differs** from the current mailbox are excluded.
+- Conversations with no `mailbox_user_id` (legacy states created before this feature) are **always included** for backwards compatibility.
+
+This prevents a common bug where multiple emails from the same sender arriving at different mailboxes get mis-correlated into the wrong thread.
+
+---
+
+## Human-in-the-Loop Review Queue
+
+When automated processing cannot complete a shipment, the case is routed to the HITL Review Queue where an operator can review and approve it.
+
+### Routing Triggers (in priority order)
+
+| Trigger | Condition |
+|---|---|
+| `max_retries` | Customer did not respond after N follow-up attempts |
+| `send_error` | Follow-up email could not be sent (Graph API failure) |
+| `no_customer_match` | No Brokerware customer matched to the sender email/domain |
+| `low_confidence` | Extraction confidence below threshold with missing fields |
+
+### Review Queue Workflow
+
+1. Shipment is routed to the queue and saved as a `ReviewRequest` blob.
+2. Operator opens the **Review Queue** panel in the Streamlit dashboard.
+3. For each pending review, the operator sees:
+   - Routing reason and flags
+   - Extracted shipment data (read-only reference)
+   - Editable form for any missing fields
+   - **Brokerware Customer ID** input (shown for `no_customer_match` cases)
+   - Reviewer notes field
+4. Operator clicks **Approve & Complete**:
+   - Reviewer-supplied field values are merged into the shipment
+   - Shipment is submitted to Brokerware TMS immediately
+   - `ConversationState` is updated to `status = "complete"`
+5. Operator clicks **Reject** to discard the review.
+
+### Customer ID for No-Match Cases
+
+For `no_customer_match` reviews, the Review Queue form shows a **Brokerware Customer ID** number input. The operator enters the correct `customerId`, which is used for the Brokerware submission. After approval, this ID can be added to `BROKERWARE_CUSTOMER_EMAIL_MAP` to prevent the same sender triggering a manual review in the future.
+
+---
+
+## Customer ID Resolution
+
+Customer ID resolution happens in this priority order for every incoming email:
+
+### 1. Static Email Map (highest priority)
+
+`BROKERWARE_CUSTOMER_EMAIL_MAP` env var is checked first. If the sender email matches an entry, the `customerId` for the current tenant is used directly — no API call made.
+
+```json
+{"jack3pl@outlook.com": {"shepherd": 4098014}}
+```
+
+### 2. Live Brokerware Contacts API
+
+If the sender is not in the static map, the system queries the Brokerware `CustomerContacts` API:
+- Tries exact email match first
+- Falls back to domain-based matching if a single customer owns the domain
+- Result is cached in memory for the session
+
+### 3. Brokerware JSON in Email Body (fallback)
+
+If both the static map and live API return no match, and the email body contains a Brokerware-format JSON block with a `customerId` field, that value is used:
+
+```json
+{"customerId": 4098014, "shipperZip": "77077", "consigneeZip": "78626", ...}
+```
+
+### 4. No match → HITL
+
+If no customer ID can be resolved for a `shipment_tender` email, the case is routed to the HITL Review Queue with reason `no_customer_match`.
 
 ---
 
 ## Multi-Tenant Brokerware Setup
 
-Shepherd AI supports multiple Brokerware tenants routed by the incoming mailbox UPN.
+Shepherd AI routes Brokerware API calls to the correct tenant based on which mailbox received the email.
 
 ### Configuration
 
-Set `BROKERWARE_MAILBOX_TENANT_MAP` to a JSON object mapping lowercase mailbox UPNs to tenant keys:
+Set `BROKERWARE_MAILBOX_TENANT_MAP` to map lowercase mailbox UPNs to tenant keys:
 
 ```json
 {
-  "shepherd@3plsystems0.onmicrosoft.com": "shepherd",
+  "shepherd@3plsystems0.onmicrosoft.com":  "shepherd",
   "shepherd1@3plsystems0.onmicrosoft.com": "shepherd",
   "shepherd2@3plsystems0.onmicrosoft.com": "shepherdwest"
 }
 ```
 
-For each unique tenant key (e.g. `SHEPHERD`, `SHEPHERDWEST`), provide the following env vars using the key as the infix:
+For each unique tenant key, provide these env vars (key uppercased as infix):
 
 ```bash
 # Tenant: shepherd
@@ -633,50 +975,121 @@ BROKERWARE_SHEPHERDWEST_USERNAME="shepherdwest@3plsystems.com"
 BROKERWARE_SHEPHERDWEST_PASSWORD="<password>"
 ```
 
-The `BrokerwareClient` automatically selects the correct tenant credentials based on the `mailbox_upn` of the incoming email.
+`BrokerwareClient` selects the correct tenant credentials based on the `mailbox_upn` of the incoming email.
 
 ---
 
-## Follow-Up System
+## Deployment
 
-When required shipment fields are missing after the initial extraction, the system automatically sends follow-up reminder emails in the original thread.
-
-### How It Works
-
-1. **Initial email processed** → OpenAI extracts fields; `ReplyMerger._compute_missing()` is applied immediately so all missing fields (including ZIP codes) are flagged upfront.
-2. **Single follow-up per email** → Even if an email has multiple attachments (multiple shipment records), the system sends **one** follow-up reply containing the union of missing fields from all attachments. It never sends one reply per attachment.
-3. **`ConversationState` saved** to Blob with `status = "awaiting_reply"`, `missing_fields` populated.
-4. **Re-processing guard** → If the same original email is processed again (e.g. a reply arrives and the inbox poller re-queues it), `handle_initial_extraction` checks existing conversation state first. If state is `complete`, `max_retries_reached`, or `awaiting_reply` with a follow-up already sent, it returns immediately without sending another follow-up or overwriting state.
-5. **Customer replies** → `process_email` re-runs extraction, merges context from prior exchanges, re-attempts field extraction.
-6. **Timer fires** (`send_reminder_followups`) → finds all `awaiting_reply` conversations stale longer than `FOLLOWUP_REMINDER_INTERVAL_MINUTES`.
-7. **`FollowupOrchestrator.send_timeout_followup()`** sends a follow-up reply via `graph_client.send_reply()` in the same email thread.
-8. **Max retries reached** → status changes to `max_retries_reached`, no further follow-ups.
-
-### Per-Customer Follow-Up Limits
-
-Limits are resolved in priority order:
-1. `customer_retry_config` table in PostgreSQL (per `customerId`)
-2. `FOLLOWUP_MAX_BY_CUSTOMER` env var JSON: `{"customerId": maxCount}`
-3. `FOLLOWUP_DEFAULT_MAX` global default (default: `3`)
-
-### Manual Testing
+### Prerequisites
 
 ```bash
-# List all active conversations
-python scripts/test_reminder.py --list
-
-# Preview which conversations would get a reminder (no emails sent)
-python scripts/test_reminder.py --dry-run
-
-# Send reminder emails to all stale conversations
-python scripts/test_reminder.py --send
-
-# Override stale threshold to 1 minute
-python scripts/test_reminder.py --send --minutes 1
-
-# Force-send a reminder to one specific conversation
-python scripts/test_reminder.py --send --conv-id <conversation_id>
+az login
+az account set --subscription "<subscription-id-or-name>"
 ```
+
+### Deploy Function App
+
+```bash
+# From the backend/ directory
+func azure functionapp publish shepherdai-funcapp --python
+
+# Verify
+az functionapp show \
+  --name shepherdai-funcapp \
+  --resource-group ShepherdAI-Quadrant-rg \
+  --query "state" -o tsv
+```
+
+### Deploy Streamlit Web App
+
+```bash
+# Create deployment zip (cross-platform — works on Windows and Linux)
+python -c "
+import zipfile, os, pathlib
+skip = {'.git','venv','__pycache__','output','.pytest_cache'}
+with zipfile.ZipFile('deploy_webapp.zip','w',zipfile.ZIP_DEFLATED) as z:
+    for p in pathlib.Path('.').rglob('*'):
+        if any(s in p.parts for s in skip): continue
+        if p.suffix == '.pyc': continue
+        if p.is_file(): z.write(p)
+print('Done')
+"
+
+# Deploy to App Service
+az webapp deploy \
+  --name ShepherdAI-Quad-WebApp \
+  --resource-group ShepherdAI-Quadrant-rg \
+  --src-path deploy_webapp.zip \
+  --type zip \
+  --async true
+
+# Verify
+az webapp show \
+  --name ShepherdAI-Quad-WebApp \
+  --resource-group ShepherdAI-Quadrant-rg \
+  --query "state" -o tsv
+
+# Tail live logs
+az webapp log tail \
+  --name ShepherdAI-Quad-WebApp \
+  --resource-group ShepherdAI-Quadrant-rg
+```
+
+> **Note:** Delete `deploy_webapp.zip` after deployment — do not commit it to git.
+
+The Web App uses `startup.sh`:
+```bash
+python -m streamlit run streamlit_app.py --server.port 8000 --server.address 0.0.0.0
+```
+
+### Configure App Settings (Production)
+
+```bash
+# Function App
+az functionapp config appsettings set \
+  --name shepherdai-funcapp \
+  --resource-group ShepherdAI-Quadrant-rg \
+  --settings \
+    AZURE_OPENAI_ENDPOINT="https://shepherdai-quadrant-openai.openai.azure.com/" \
+    AZURE_OPENAI_DEPLOYMENT="gpt-5-chat" \
+    AZURE_OPENAI_API_VERSION="2024-02-15-preview" \
+    AZURE_OPENAI_EMBEDDING_DEPLOYMENT="text-embedding-3-small" \
+    AZURE_SEARCH_INDEX_NAME="customer-contacts" \
+    GRAPH_WEBHOOK_NOTIFICATION_URL="https://shepherdai-apim.azure-api.net/functions/graph_webhook" \
+    GRAPH_WEBHOOK_CLIENT_STATE="shepherd-ai-webhook" \
+    FOLLOWUP_TIMER_SCHEDULE="0 0 */24 * * *" \
+    FOLLOWUP_REMINDER_INTERVAL_MINUTES="1440" \
+    FOLLOWUP_DEFAULT_MAX="3" \
+    APIM_STRICT_ENFORCEMENT="true"
+
+# Web App
+az webapp config appsettings set \
+  --name ShepherdAI-Quad-WebApp \
+  --resource-group ShepherdAI-Quadrant-rg \
+  --settings \
+    WEBSITES_PORT="8000" \
+    AZURE_OPENAI_DEPLOYMENT="gpt-5-chat"
+```
+
+---
+
+## Webhook Registration
+
+After deploying the Function App for the first time (or after rotating secrets), register Graph subscriptions for all configured mailboxes:
+
+```bash
+FUNC_KEY=$(az functionapp keys list \
+  --name shepherdai-funcapp \
+  --resource-group ShepherdAI-Quadrant-rg \
+  --query "functionKeys.default" -o tsv)
+
+curl -X POST \
+  "https://shepherdai-funcapp.azurewebsites.net/api/register_webhooks?code=${FUNC_KEY}" \
+  -H "Content-Type: application/json"
+```
+
+The function creates one Graph subscription per mailbox listed in `GRAPH_MAILBOX_USER_IDS`. Subscriptions expire after 72 hours and are renewed automatically by `renew_subscriptions`.
 
 ---
 
@@ -684,7 +1097,7 @@ python scripts/test_reminder.py --send --conv-id <conversation_id>
 
 ### APIM Subscription Key
 
-All inbound requests pass through Azure API Management. APIM injects the subscription key in the `Ocp-Apim-Subscription-Key` header; the `apim_guard.py` module validates it using constant-time comparison.
+All inbound requests pass through Azure API Management. APIM injects the subscription key; `apim_guard.py` validates it using constant-time comparison.
 
 - Set `APIM_SUBSCRIPTION_KEY` (from Key Vault: `apim-subscription-key`)
 - Set `APIM_STRICT_ENFORCEMENT=true` in production to block traffic when the key is absent
@@ -694,21 +1107,21 @@ All inbound requests pass through Azure API Management. APIM injects the subscri
 Admin endpoints (e.g. `register_webhooks`) require a valid Azure AD JWT (RS256) with the `WebhookAdmin` app role.
 
 - `RBAC_ADMIN_ROLES` — comma-separated list of allowed roles (default: `WebhookAdmin`)
-- JWKS public keys are fetched from Azure AD and cached for `AZURE_AD_JWKS_CACHE_TTL` seconds (default 1 hour)
+- JWKS public keys are fetched from Azure AD and cached for `AZURE_AD_JWKS_CACHE_TTL` seconds
 
 ### Azure Key Vault Integration
 
-Set `KEY_VAULT_URL` to enable automatic secret loading at startup via `DefaultAzureCredential` (Managed Identity in Azure, CLI credentials locally):
+Set `KEY_VAULT_URL` to enable automatic secret loading via `DefaultAzureCredential` (Managed Identity in Azure, CLI credentials locally):
 
 ```bash
 KEY_VAULT_URL=https://shepherd-ai-kv.vault.azure.net/
 ```
 
-Secrets in Key Vault must use hyphens in their names (e.g. `azure-openai-key`); `secrets.py` maps them to environment variables.
+Secrets use hyphens in Key Vault (e.g. `azure-openai-key`); `secrets.py` maps them to environment variables.
 
 ### Input Validation
 
-- `MAX_EMAIL_BODY_CHARS` — rejects email bodies exceeding limit (default 500 000 chars)
+- `MAX_EMAIL_BODY_CHARS` — rejects email bodies exceeding limit (default 500,000 chars)
 - `MAX_ATTACHMENT_BYTES` — rejects attachments exceeding limit (default 25 MB)
 - `prompt_guard.py` — detects and blocks prompt injection in email content
 
@@ -739,10 +1152,10 @@ az webapp show \
 ### Live Logs
 
 ```bash
-# Function App logs
+# Function App
 func azure functionapp logstream shepherdai-funcapp
 
-# Web App logs
+# Web App
 az webapp log tail \
   --name ShepherdAI-Quad-WebApp \
   --resource-group ShepherdAI-Quadrant-rg
@@ -751,12 +1164,10 @@ az webapp log tail \
 ### Restart Services
 
 ```bash
-# Restart Function App
 az functionapp restart \
   --name shepherdai-funcapp \
   --resource-group ShepherdAI-Quadrant-rg
 
-# Restart Web App
 az webapp restart \
   --name ShepherdAI-Quad-WebApp \
   --resource-group ShepherdAI-Quadrant-rg
@@ -765,7 +1176,7 @@ az webapp restart \
 ### Health Check
 
 ```bash
-# Public health endpoint (anonymous)
+# Direct
 curl https://shepherdai-funcapp.azurewebsites.net/api/health
 
 # Via APIM
@@ -776,29 +1187,24 @@ curl https://shepherdai-apim.azure-api.net/functions/health \
 ### Git Operations
 
 ```bash
-# Current branch
 git branch
-
-# Push to origin
 git push origin chinmaya
-
-# View recent commits
 git log --oneline -10
 ```
 
 ### PostgreSQL
 
 ```bash
-# Connect via psql
+# Connect
 psql "postgresql://shephardai:<password>@shepherddb.postgres.database.azure.com:5432/postgres?sslmode=require"
 
-# Check email audit log
+# Email audit log
 SELECT id, sender_email, subject, status, created_at FROM email_records ORDER BY created_at DESC LIMIT 20;
 
-# Check per-customer retry config
+# Per-customer retry config
 SELECT * FROM customer_retry_config;
 
-# Update retry limit for a customer
+# Update retry limit
 UPDATE customer_retry_config SET retry_count = 5 WHERE client_id = '<id>';
 ```
 
@@ -812,7 +1218,7 @@ az storage blob list \
   --prefix "conversations/" \
   --output table
 
-# Download a specific conversation state
+# Download a specific conversation
 az storage blob download \
   --container-name processed-logs \
   --name "conversations/<conversation_id>.json" \
@@ -823,27 +1229,24 @@ az storage blob download \
 ### Subscription Management
 
 ```bash
-# List active Graph subscriptions (via health endpoint)
+# View active subscriptions via health endpoint
 curl https://shepherdai-funcapp.azurewebsites.net/api/health | python -m json.tool
 
-# Force-renew subscriptions (call the timer function manually via APIM)
-# Or wait for the 47-hour timer to fire automatically
+# Subscriptions auto-renew every 47 hours via renew_subscriptions timer
 ```
 
 ### Azure Firewall Egress Rules
 
 The Web App runs in `snet-app` (`10.0.0.0/24`) with all egress routed through `shepherdai-firewall`. Any new external FQDN the app needs to reach must be explicitly allowed.
 
-To add an egress rule for a new FQDN:
-
-1. Export the current firewall policy rules:
+**Step 1** — Export current firewall policy rules:
 ```bash
 az rest --method GET \
   --url "https://management.azure.com/subscriptions/<sub-id>/resourceGroups/ShepherdAI-Quadrant-rg/providers/Microsoft.Network/firewallPolicies/shepherdai-firewall-policy/ruleCollectionGroups/DefaultApplicationRuleCollectionGroup?api-version=2023-11-01" \
   --output json > fw_current.json
 ```
 
-2. Edit `fw_current.json` — add a new entry under the `Allow-ShepherdAI-Outbound` rule collection:
+**Step 2** — Edit `fw_current.json`, add a new entry under `Allow-ShepherdAI-Outbound`:
 ```json
 {
   "name": "allow-<service>",
@@ -855,56 +1258,11 @@ az rest --method GET \
 }
 ```
 
-3. Apply the update:
+**Step 3** — Apply the update:
 ```bash
 az rest --method PUT \
   --url "https://management.azure.com/subscriptions/<sub-id>/resourceGroups/ShepherdAI-Quadrant-rg/providers/Microsoft.Network/firewallPolicies/shepherdai-firewall-policy/ruleCollectionGroups/DefaultApplicationRuleCollectionGroup?api-version=2023-11-01" \
   --body @fw_update.json
 ```
 
-> **Important:** The source must always be `10.0.0.0/24` (the `snet-app` subnet). Using any other CIDR will silently default-deny the traffic — which manifests as an `SSLEOFError` during the TLS handshake.
-
----
-
-## Document Types Supported
-
-| Document | Key Data Extracted |
-|---|---|
-| Bill of Lading (BOL) | Pickup/drop locations, shipment ID, items, carrier |
-| Picking List | Line items, delivery date, shipper info |
-| Sales Order | Order number, PO number, items, ship-via (equipment mode) |
-| Email body | Routing context, reference numbers, contacts, pickup date |
-
----
-
-## Extraction Pipeline (2-Pass)
-
-```
-Email body + all attachment text
-         │
-         ▼  Pass 1 — Envelope Extraction
-Azure OpenAI
-  → pickup / drop locations and dates
-  → equipment type and mode
-  → reference numbers
-  → customer context
-         │
-         ├──────────────────────────────────────────────────┐
-         │                                                  │
-         ▼  Pass 2 — Detailed Shipment                      │
-Azure OpenAI (per attachment + envelope as read-only)       │
-  → line items (pieces, weight, description)                │
-  → shipper / consignee address details                     │
-  → special instructions                                    │
-         │                                                  │
-         ▼                                                  │
-Customer Lookup ◄──────────────────────────────────────────┘
-  → Azure AI Search (vector cosine similarity ≥ 0.70)
-  → Brokerware API (/api/client/{id}/customer)
-  → Resolve customerId
-         │
-         ▼
-Brokerware TMS
-  → Create shipment
-  → Return shipment ID
-```
+> **Important:** Source must always be `10.0.0.0/24` (the `snet-app` subnet). An incorrect CIDR causes silent default-deny, manifesting as an `SSLEOFError` during TLS handshake.
