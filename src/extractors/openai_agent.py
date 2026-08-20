@@ -2,6 +2,7 @@
 Azure OpenAI agent for prompts and JSON structuring
 """
 import json
+import re
 from typing import List, Optional
 from openai import AzureOpenAI
 from src.config import Config
@@ -29,6 +30,48 @@ class OpenAIAgent:
             api_version=self.api_version,
             azure_endpoint=self.endpoint
         )
+
+    @staticmethod
+    def _apply_brokerware_fallback(text: str, shipment: Shipment) -> bool:
+        """
+        Parse Brokerware-format JSON from the raw text and fill any ZIP codes
+        that the LLM missed because Brokerware uses different field names
+        (e.g. shipperZip / consigneeZip) instead of our schema's
+        pickupLocation.address.zipCode / dropLocation.address.zipCode.
+
+        Only fills fields that are still null — never overwrites extracted data.
+        Returns True if at least one field was populated.
+        """
+        data: dict = {}
+        try:
+            data = json.loads(text.strip())
+        except (json.JSONDecodeError, ValueError):
+            match = re.search(r'\{[\s\S]+\}', text)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        if not data or not isinstance(data, dict):
+            return False
+
+        filled = False
+        rf = shipment.required_fields
+
+        if (data.get('shipperZip') and rf.pickup_location and rf.pickup_location.address
+                and not rf.pickup_location.address.zip_code):
+            rf.pickup_location.address.zip_code = str(data['shipperZip'])
+            logger.debug("Brokerware fallback: shipperZip=%s", data['shipperZip'])
+            filled = True
+
+        if (data.get('consigneeZip') and rf.drop_location and rf.drop_location.address
+                and not rf.drop_location.address.zip_code):
+            rf.drop_location.address.zip_code = str(data['consigneeZip'])
+            logger.debug("Brokerware fallback: consigneeZip=%s", data['consigneeZip'])
+            filled = True
+
+        return filled
 
     def extract_email_envelope(
         self,
@@ -122,6 +165,10 @@ class OpenAIAgent:
             # Authoritative missing-field check — catches fields OpenAI
             # may miss (e.g. ZIP when city/state are present).
             shipment.missing_required_fields = ReplyMerger._compute_missing(shipment)
+            # Brokerware-format fallback: fill ZIPs from shipperZip/consigneeZip
+            # if the LLM didn't map them to our schema.
+            if self._apply_brokerware_fallback(attachment_text, shipment):
+                shipment.missing_required_fields = ReplyMerger._compute_missing(shipment)
 
             logger.info("Successfully extracted shipment data")
             return shipment
@@ -230,6 +277,8 @@ Return only valid JSON."""
                 try:
                     s = Shipment.model_validate(item)
                     s.missing_required_fields = ReplyMerger._compute_missing(s)
+                    if self._apply_brokerware_fallback(body_text, s):
+                        s.missing_required_fields = ReplyMerger._compute_missing(s)
                     shipments.append(s)
                 except Exception as e:
                     logger.error(f"Failed to parse body shipment: {e}")
