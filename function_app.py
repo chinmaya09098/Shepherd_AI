@@ -452,7 +452,7 @@ def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) 
 
         # ── 2. Reply detection ────────────────────────────────────────────────
         orchestrator = FollowupOrchestrator()
-        is_reply     = orchestrator.is_tracked_reply(mail_message)
+        is_reply     = orchestrator.is_tracked_reply(mail_message, mailbox_upn=target_mailbox or "")
         logger.info(
             "message_id=%s type=%s conv_id=%s",
             message_id,
@@ -572,7 +572,7 @@ def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) 
 
         # ── 9. Follow-up orchestration [SOW §10b] ─────────────────────────────
         if is_reply:
-            correlation = orchestrator.correlate_message(mail_message)
+            correlation = orchestrator.correlate_message(mail_message, mailbox_upn=target_mailbox or "")
             result = asyncio.run(
                 orchestrator.handle_reply(
                     reply_message=mail_message,
@@ -580,6 +580,7 @@ def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) 
                     graph_client=graph_client,
                     access_token=access_token,
                     correlation=correlation if correlation.is_reply else None,
+                    mailbox_upn=target_mailbox or "",
                 )
             )
         else:
@@ -590,6 +591,7 @@ def _run_email_pipeline(message_id: str, mailbox_user_id: Optional[str] = None) 
                     graph_client=graph_client,
                     access_token=access_token,
                     customer_id=customer_id,
+                    mailbox_upn=target_mailbox or "",
                 )
             )
 

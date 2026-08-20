@@ -208,20 +208,33 @@ class ConversationTracker:
         state = self.load(conversation_id)
         return state if (state and state.status == "awaiting_reply") else None
 
-    def list_active(self) -> List[ConversationState]:
+    def list_active(self, mailbox_upn: Optional[str] = None) -> List[ConversationState]:
         """Return all conversations currently in 'awaiting_reply' status.
 
         Sources (in order, deduplicating by conversation_id):
           1. In-memory cache (fastest — same process)
           2. Azure Blob Storage (production — across process restarts / scheduler runs)
           3. Local disk (development fallback / offline)
+
+        Args:
+            mailbox_upn: When supplied, excludes conversations whose
+                ``mailbox_user_id`` is known and differs from this mailbox.
+                Conversations with no recorded ``mailbox_user_id`` (legacy
+                states, or states from before this filter existed) are still
+                included — the filter only rejects a *known* mismatch, so it
+                never breaks pre-existing in-flight conversations.
         """
         active:   List[ConversationState] = []
         seen_ids: set                     = set()
 
+        def _mailbox_ok(state: ConversationState) -> bool:
+            if not mailbox_upn or not state.mailbox_user_id:
+                return True
+            return state.mailbox_user_id.lower() == mailbox_upn.lower()
+
         # 1. In-memory cache first
         for state in list(self._cache.values()):
-            if state.status == "awaiting_reply":
+            if state.status == "awaiting_reply" and _mailbox_ok(state):
                 active.append(state)
                 seen_ids.add(state.conversation_id)
 
@@ -242,6 +255,7 @@ class ConversationTracker:
                         if (
                             state.status == "awaiting_reply"
                             and state.conversation_id not in seen_ids
+                            and _mailbox_ok(state)
                         ):
                             active.append(state)
                             seen_ids.add(state.conversation_id)
@@ -258,7 +272,11 @@ class ConversationTracker:
                     state = ConversationState.model_validate_json(
                         json_file.read_text(encoding="utf-8")
                     )
-                    if state.status == "awaiting_reply" and state.conversation_id not in seen_ids:
+                    if (
+                        state.status == "awaiting_reply"
+                        and state.conversation_id not in seen_ids
+                        and _mailbox_ok(state)
+                    ):
                         active.append(state)
                         seen_ids.add(state.conversation_id)
                         self._cache[state.conversation_id] = state
@@ -301,6 +319,7 @@ class ConversationTracker:
         self,
         message: MailMessage,
         reference_ids: Optional[List[str]] = None,
+        mailbox_upn: str = "",
     ) -> CorrelationResult:
         """
         Try to match an incoming message to a tracked active conversation.
@@ -313,6 +332,12 @@ class ConversationTracker:
             reference_ids: Additional reference IDs extracted from the email
                            (shipment_id, order_number, purchase_order, etc.)
                            that supplement those already on the message itself.
+            mailbox_upn:   UPN of the mailbox that received ``message``. Strategies
+                           2-4 (reference_id, subject, sender) only consider active
+                           conversations from this same mailbox — a conversation
+                           with no recorded mailbox (legacy data) still matches.
+                           Strategy 1 (exact conversationId) is never mailbox-filtered
+                           since Graph conversationIds are inherently unique per thread.
 
         Returns:
             CorrelationResult with the matched state and match metadata.
@@ -345,7 +370,7 @@ class ConversationTracker:
                 )
 
         # Load all active conversations once for the remaining strategies
-        active = self.list_active()
+        active = self.list_active(mailbox_upn=mailbox_upn)
         if not active:
             return CorrelationResult()
 

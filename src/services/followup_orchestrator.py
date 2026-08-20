@@ -100,6 +100,7 @@ class FollowupOrchestrator:
         graph_client: GraphClient,
         access_token: str,
         customer_id:  Optional[int] = None,
+        mailbox_upn:  str = "",
     ) -> FollowupResult:
         """
         Called after extracting a shipment from a customer's email.
@@ -184,6 +185,7 @@ class FollowupOrchestrator:
             max_followups     = max_followups,
             customer_id       = customer_id,
             status            = "processing",
+            mailbox_user_id   = mailbox_upn or None,
         )
         state.add_event(
             EVENT_EMAIL_INGESTED,
@@ -283,17 +285,18 @@ class FollowupOrchestrator:
         graph_client:   GraphClient,
         access_token:   str,
         correlation:    Optional[CorrelationResult] = None,
+        mailbox_upn:    str = "",
     ) -> FollowupResult:
         """
         Called when a customer reply is detected in a tracked conversation.
 
         If no CorrelationResult is supplied, performs correlation internally
-        using all four fallback strategies.
+        using all four fallback strategies, scoped to ``mailbox_upn``.
         """
         # Resolve correlation if not provided by caller
         if correlation is None:
             ref_ids     = _extract_reference_ids(reply_shipment)
-            correlation = self._tracker.correlate_message(reply_message, ref_ids)
+            correlation = self._tracker.correlate_message(reply_message, ref_ids, mailbox_upn=mailbox_upn)
 
         if not correlation.state:
             return FollowupResult(
@@ -595,19 +598,21 @@ class FollowupOrchestrator:
         self,
         message:       MailMessage,
         reference_ids: Optional[List[str]] = None,
+        mailbox_upn:   str = "",
     ) -> CorrelationResult:
         """
         Correlate an incoming message to a tracked conversation using all
-        four fallback strategies. Exposes ConversationTracker.correlate_message.
+        four fallback strategies, scoped to ``mailbox_upn``. Exposes
+        ConversationTracker.correlate_message.
         """
-        return self._tracker.correlate_message(message, reference_ids or [])
+        return self._tracker.correlate_message(message, reference_ids or [], mailbox_upn=mailbox_upn)
 
-    def is_tracked_reply(self, message: MailMessage) -> bool:
+    def is_tracked_reply(self, message: MailMessage, mailbox_upn: str = "") -> bool:
         """
         Quick boolean check — True if the message is a customer reply in a
         tracked conversation (backward-compatible wrapper).
         """
-        result = self.correlate_message(message)
+        result = self.correlate_message(message, mailbox_upn=mailbox_upn)
         return result.is_reply
 
     def get_conversation_state(self, conversation_id: Optional[str]) -> Optional[ConversationState]:

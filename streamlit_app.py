@@ -851,6 +851,23 @@ def process_graph_email(email_data: dict, message_id: str, submit_shipments: boo
                 st.warning(f"Brokerware contact lookup error: {e}")
                 resolved_customer_id = None
 
+        # Fallback: if sender isn't in Brokerware contacts, try parsing customerId
+        # from a Brokerware-format JSON block embedded in the email body.
+        if resolved_customer_id is None:
+            try:
+                import re as _re
+                _body_text = email_data.get('body', '')
+                _bw_match = _re.search(r'\{[\s\S]+\}', _body_text)
+                if _bw_match:
+                    import json as _bw_json
+                    _bw_data = _bw_json.loads(_bw_match.group())
+                    if isinstance(_bw_data, dict) and _bw_data.get('customerId'):
+                        resolved_customer_id = int(_bw_data['customerId'])
+                        logger.info("Brokerware customerId fallback from email body: %s", resolved_customer_id)
+                        st.info(f"Customer ID resolved from Brokerware JSON in email body: `{resolved_customer_id}`")
+            except Exception:
+                pass
+
         attachments = email_data.get('attachments', [])
 
         if attachments:
@@ -1520,7 +1537,9 @@ GRAPH_REDIRECT_URI=http://localhost:8501
             # ── Thread-aware correlation (four fallback strategies) ────────
             try:
                 _orchestrator = FollowupOrchestrator()
-                _correlation  = _orchestrator.correlate_message(selected_message)
+                _correlation  = _orchestrator.correlate_message(
+                    selected_message, mailbox_upn=st.session_state.get('graph_user', '')
+                )
                 st.session_state.graph_correlation_result = _correlation
                 st.session_state.graph_is_tracked_reply   = _correlation.is_reply
             except Exception:
@@ -1582,6 +1601,7 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                                         graph_client=reply_client,
                                         access_token=reply_token.access_token,
                                         correlation=st.session_state.graph_correlation_result,
+                                        mailbox_upn=st.session_state.get('graph_user', ''),
                                     )
                                 )
                                 # Replace the extracted shipment with the merged version
@@ -1658,10 +1678,60 @@ GRAPH_REDIRECT_URI=http://localhost:8501
                                                         graph_client=_auto_client,
                                                         access_token=_auto_token.access_token,
                                                         customer_id=_get_customer_id(_sd),
+                                                        mailbox_upn=st.session_state.get('graph_user', ''),
                                                     )
                                                 )
                                                 st.session_state.followup_results[_idx] = _result
                                                 _followup_sent_this_email = True
+
+                                                # If the conversation was already complete (e.g. this
+                                                # is a re-processed email for a closed thread), submit
+                                                # to Brokerware now — the normal path won't run because
+                                                # submit_shipments=True only fires when no missing fields.
+                                                if _result.action == "complete":
+                                                    _cs = _orch.get_conversation_state(_result.conversation_id)
+                                                    _cid = (
+                                                        _cs.customer_id
+                                                        if _cs and _cs.customer_id is not None
+                                                        else _get_customer_id(_sd)
+                                                    )
+                                                    # Prefer the fully-merged shipment stored in blob
+                                                    # over the re-extracted one (which may still be
+                                                    # partial if the LLM missed fields this pass).
+                                                    _ship_to_use = None
+                                                    if _cs and _cs.partial_shipment:
+                                                        try:
+                                                            _ship_to_use = Shipment.model_validate(
+                                                                _cs.partial_shipment
+                                                            )
+                                                        except Exception:
+                                                            _ship_to_use = None
+                                                    if _ship_to_use is None:
+                                                        _ship_to_use = _result.shipment
+                                                    # Only submit if the shipment we're about to send
+                                                    # is actually complete — never push a still-partial
+                                                    # shipment just because the conversation record says
+                                                    # "complete" (e.g. merged data itself has a gap).
+                                                    if _ship_to_use and not _has_blocking_missing_fields(_ship_to_use):
+                                                        st.success(
+                                                            "Conversation already complete — "
+                                                            "submitting merged shipment to Brokerware TMS…"
+                                                        )
+                                                        _submit_to_brokerware(
+                                                            _ship_to_use,
+                                                            customer_id=_cid,
+                                                            mailbox_upn=st.session_state.get('graph_user', ''),
+                                                        )
+                                                    else:
+                                                        _still_missing = (
+                                                            _ship_to_use.missing_required_fields
+                                                            if _ship_to_use else ["unknown"]
+                                                        )
+                                                        st.warning(
+                                                            "Conversation is marked complete but required "
+                                                            f"fields are still missing ({', '.join(_still_missing)}) "
+                                                            "— skipping Brokerware submission. This needs manual review."
+                                                        )
                                             except Exception as _exc:
                                                 logger.error(
                                                     "Auto follow-up failed: %s", _exc, exc_info=True
@@ -1965,6 +2035,22 @@ def _render_review_queue_panel():
             else:
                 st.info("No specific missing fields recorded — reviewer can approve as-is.")
 
+            # ── Customer ID input (for no_customer_match reviews) ──────────────
+            from src.models.review_request import REVIEW_REASON_NO_CUSTOMER
+            reviewer_customer_id: Optional[int] = None
+            if req.review_reason == REVIEW_REASON_NO_CUSTOMER:
+                st.markdown("**Brokerware Customer ID** (required to create shipment):")
+                _cid_val = st.number_input(
+                    "Customer ID:",
+                    min_value=1,
+                    value=None,
+                    step=1,
+                    key=f"rv_cid_{short_id}",
+                    help="Enter the Brokerware customerId for this sender so the shipment can be created.",
+                )
+                reviewer_customer_id = int(_cid_val) if _cid_val else None
+                st.markdown("---")
+
             # ── Extracted data reference ───────────────────────────────────────
             with st.expander("View extracted shipment data (read-only)"):
                 import json as _json
@@ -2048,7 +2134,30 @@ def _render_review_queue_panel():
                     except Exception as exc:
                         logger.warning("Could not update ConversationState after HITL approval: %s", exc)
 
-                st.success(f"Review {short_id}… approved. Shipment marked as complete.")
+                # ── Submit to Brokerware TMS ───────────────────────────────────
+                try:
+                    from src.models.shipment import Shipment as _ApprovedShipment
+                    _ship_to_submit = _ApprovedShipment.model_validate(approved)
+                    # Resolve customer_id: reviewer-entered → conversation state → None
+                    _submit_cid: Optional[int] = reviewer_customer_id
+                    if not _submit_cid and req.conversation_id:
+                        try:
+                            from src.services.conversation_tracker import ConversationTracker as _CT
+                            _cs = _CT().load(req.conversation_id)
+                            if _cs and _cs.customer_id:
+                                _submit_cid = _cs.customer_id
+                        except Exception:
+                            pass
+                    _submit_to_brokerware(
+                        _ship_to_submit,
+                        customer_id=_submit_cid,
+                        mailbox_upn=st.session_state.get('graph_user', ''),
+                    )
+                except Exception as _sub_exc:
+                    st.warning(f"Brokerware submission error after approval: {_sub_exc}")
+                    logger.warning("HITL approve: Brokerware submission failed: %s", _sub_exc)
+
+                st.success(f"Review {short_id}… approved.")
                 st.rerun()
 
             # ── Handle rejection ──────────────────────────────────────────────
@@ -2523,6 +2632,7 @@ def _display_missing_fields_form(shipment_idx: int):
                                         graph_client=client,
                                         access_token=graph_token.access_token,
                                         customer_id=_get_customer_id(_sd),
+                                        mailbox_upn=st.session_state.get('graph_user', ''),
                                     )
                                 )
                                 st.session_state.followup_results[shipment_idx] = result
