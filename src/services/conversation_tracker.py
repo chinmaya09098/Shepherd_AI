@@ -14,10 +14,16 @@ Blob path scoping:
   TENANT_ID_SCOPE is first introduced.
 
 Correlation strategies (in priority order):
-  1. conversation_id  — exact Graph conversationId match          (confidence 1.0)
-  2. reference_id     — shared shipment/order/PO reference number  (confidence 0.9)
-  3. subject          — normalised subject-line match              (confidence 0.80–0.85)
-  4. sender           — same sender email, single open thread      (confidence 0.6–0.75)
+  1. conversation_id  — exact Graph conversationId match           (confidence 1.0)
+  2. reference_id     — shared shipment/order/PO reference number   (confidence 0.9)
+  3. subject          — normalised subject-line exact match         (confidence 0.80–0.85)
+  4. sender+subject   — same sender AND overlapping subject text    (confidence 0.75)
+
+  Sender identity alone is never sufficient to treat a message as a reply —
+  a sender can have multiple unrelated open shipments at once, so Strategy 4
+  always requires some subject-text overlap with the candidate conversation.
+  A message that matches on sender but shares no subject text with any open
+  conversation is left uncorrelated rather than guessed into the wrong one.
 """
 from __future__ import annotations
 
@@ -69,9 +75,8 @@ class CorrelationResult:
         method:     How the match was made:
                         "conversation_id"  — exact Graph thread ID (most reliable)
                         "reference_id"     — shared shipment/order/PO number
-                        "subject"          — normalised subject-line match
-                        "sender+subject"   — sender match narrowed by subject
-                        "sender"           — same sender, only one open thread
+                        "subject"          — normalised subject-line exact match
+                        "sender+subject"   — same sender AND overlapping subject text
                         "none"             — no match found
         confidence: 0.0–1.0 indicating match reliability.
         is_reply:   True when state is set and message is a genuine customer reply
@@ -415,43 +420,34 @@ class ConversationTracker:
                     is_reply=True,
                 )
 
-        # ── Strategy 4: sender email ──────────────────────────────────────
-        if sender_raw:
+        # ── Strategy 4: sender email + overlapping subject text ────────────
+        # Sender identity alone is NOT evidence of a reply — a sender can
+        # easily have multiple unrelated open shipments in flight at once.
+        # This always requires some subject-text overlap with the candidate
+        # conversation, even when that sender has only one open conversation.
+        # A same-sender message with no subject overlap is left uncorrelated
+        # (extracted independently) rather than merged into an unrelated thread.
+        if sender_raw and subject_norm:
             sender_matches = [
                 s for s in active
                 if s.sender_email.lower() == sender_raw
             ]
-            if len(sender_matches) == 1:
-                logger.info(
-                    "Correlation hit [sender] sender=%s conv=%s",
-                    sender_raw,
-                    sender_matches[0].conversation_id[:20],
-                )
-                return CorrelationResult(
-                    state=sender_matches[0],
-                    method="sender",
-                    confidence=0.6,
-                    is_reply=True,
-                )
-
-            if len(sender_matches) > 1 and subject_norm:
-                # Tiebreak with partial subject match
-                for s in sender_matches:
-                    if s.normalized_subject and (
-                        subject_norm in s.normalized_subject
-                        or s.normalized_subject in subject_norm
-                    ):
-                        logger.info(
-                            "Correlation hit [sender+subject] sender=%s conv=%s",
-                            sender_raw,
-                            s.conversation_id[:20],
-                        )
-                        return CorrelationResult(
-                            state=s,
-                            method="sender+subject",
-                            confidence=0.75,
-                            is_reply=True,
-                        )
+            for s in sender_matches:
+                if s.normalized_subject and (
+                    subject_norm in s.normalized_subject
+                    or s.normalized_subject in subject_norm
+                ):
+                    logger.info(
+                        "Correlation hit [sender+subject] sender=%s conv=%s",
+                        sender_raw,
+                        s.conversation_id[:20],
+                    )
+                    return CorrelationResult(
+                        state=s,
+                        method="sender+subject",
+                        confidence=0.75,
+                        is_reply=True,
+                    )
 
         return CorrelationResult()  # no match
 
