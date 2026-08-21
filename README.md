@@ -157,6 +157,20 @@ backend/
 
 ---
 
+## Tenant Configuration
+
+| | Tenant 1 — Shepherd | Tenant 2 — ShepherdWest |
+|---|---|---|
+| **Portal** | shepherd.brokerware.io | shepherdwest.brokerware.io |
+| **Brokerware Client ID** | 4097939 | 4098017 |
+| **Mailboxes monitored** | Shepherd@3plsystems0.onmicrosoft.com<br>Shepherd1@3plsystems0.onmicrosoft.com | Shepherd2@3plsystems0.onmicrosoft.com |
+
+Emails arriving at `Shepherd@3plsystems0.onmicrosoft.com` or `Shepherd1@3plsystems0.onmicrosoft.com` are processed under the **Shepherd** tenant and matched against Shepherd customer contacts.
+
+Emails arriving at `Shepherd2@3plsystems0.onmicrosoft.com` are processed under the **ShepherdWest** tenant.
+
+---
+
 ## Azure Services
 
 | Service | Purpose | Resource Name |
@@ -942,6 +956,18 @@ If no customer ID can be resolved for a `shipment_tender` email, the case is rou
 ## Multi-Tenant Brokerware Setup
 
 Shepherd AI routes Brokerware API calls to the correct tenant based on which mailbox received the email.
+
+### Tenant Configuration
+
+| | Tenant 1 — Shepherd | Tenant 2 — ShepherdWest |
+|---|---|---|
+| **Portal** | shepherd.brokerware.io | shepherdwest.brokerware.io |
+| **Brokerware Client ID** | 4097939 | 4098017 |
+| **Mailboxes monitored** | Shepherd@3plsystems0.onmicrosoft.com<br>Shepherd1@3plsystems0.onmicrosoft.com | Shepherd2@3plsystems0.onmicrosoft.com |
+
+Emails arriving at `Shepherd@3plsystems0.onmicrosoft.com` or `Shepherd1@3plsystems0.onmicrosoft.com` are processed under the **Shepherd** tenant and matched against Shepherd customer contacts.
+
+Emails arriving at `Shepherd2@3plsystems0.onmicrosoft.com` are processed under the **ShepherdWest** tenant.
 
 ### Configuration
 
